@@ -13,17 +13,17 @@ const int LED_BRIGHTNESS_YELLOW_GREEN = LED_BRIGHTNESS_FULL / 8; // yellow's gre
 const int ANALOG_PINS[3] = { 1, 2, 3 }; 
 
 // --- LED GPIO DEFINITIONS ---
-// CH1 (Socket 1) - Header Pins 32, 34
-const int CH1_RED   = 39;
-const int CH1_GREEN = 40;
+// CH1 (Socket 1)
+const int CH1_RED   = 34;
+const int CH1_GREEN = 35;
 
-// CH2 (Socket 2) - Header Pins 14, 12
-const int CH2_RED   = 36;
-const int CH2_GREEN = 37;
+// CH2 (Socket 2)
+const int CH2_RED   = 47;
+const int CH2_GREEN = 48;
 
-// CH3 (Socket 3) - Header Pins 19, 17
-const int CH3_RED   = 33;
-const int CH3_GREEN = 34;
+// CH3 (Socket 3)
+const int CH3_RED   = 38;
+const int CH3_GREEN = 39;
 
 struct SocketChannel {
   int analogPin;
