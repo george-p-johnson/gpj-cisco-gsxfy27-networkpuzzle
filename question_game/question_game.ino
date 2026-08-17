@@ -13,17 +13,17 @@ const int LED_BRIGHTNESS_YELLOW_GREEN = LED_BRIGHTNESS_FULL / 8; // yellow's gre
 const int ANALOG_PINS[3] = { 1, 2, 3 }; 
 
 // --- LED GPIO DEFINITIONS ---
-// CH1 (Socket 1) - Header Pins 32, 34
-const int CH1_RED   = 39;
-const int CH1_GREEN = 40;
+// CH1 (Socket 1) 
+const int CH1_RED   = 35;
+const int CH1_GREEN = 34;
 
-// CH2 (Socket 2) - Header Pins 14, 12
-const int CH2_RED   = 36;
-const int CH2_GREEN = 37;
+// CH2 (Socket 2) 
+const int CH2_RED   = 48;
+const int CH2_GREEN = 47;
 
-// CH3 (Socket 3) - Header Pins 19, 17
-const int CH3_RED   = 33;
-const int CH3_GREEN = 34;
+// CH3 (Socket 3) 
+const int CH3_RED   = 39;
+const int CH3_GREEN = 38;
 
 struct SocketChannel {
   int analogPin;
@@ -83,7 +83,7 @@ float pinScaleFactors[3] = { 1.0, 1.0, 1.0 };
 // DEBOUNCE_MS before accepting it filters out that insertion/removal noise.
 // Timer-based (rather than counting loop passes) so this duration is exact
 // regardless of the main loop's throttle delay.
-const unsigned long DEBOUNCE_MS = 450;
+const unsigned long DEBOUNCE_MS = 225;
 int stableIndex[3] = { 10, 10, 10 };           // last accepted (debounced) classification per channel
 int candidateIndex[3] = { 10, 10, 10 };        // classification currently being confirmed
 unsigned long candidateSinceMs[3] = { 0, 0, 0 }; // when candidateIndex[i] first appeared
@@ -211,7 +211,7 @@ void printActiveThresholds() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.setTxTimeoutMs(0); 
+  Serial.setTxTimeoutMs(0);
 
   // Initialize ESP32-S3 ADC
   analogReadResolution(12);       // 12-bit (0 - 4095)
@@ -302,13 +302,11 @@ void loop() {
     bool isMatch = isConnected && (stableIndex[i] == correctAnswers[i]);
 
     // Still deciding: the live reading hasn't yet been confirmed as the new
-    // stable classification, so show solid yellow instead of jumping to red/green.
+    // stable classification, so keep the LED off instead of jumping to red/green.
     bool isDeciding = (detectedIndex != stableIndex[i]);
 
     LEDState ledState = LED_OFF;
-    if (isDeciding) {
-      ledState = LED_YELLOW;
-    } else if (isConnected) {
+    if (!isDeciding && isConnected) {
       ledState = isMatch ? LED_GREEN : LED_RED;
     }
     setLEDState(channels[i].redPin, channels[i].greenPin, ledState);
@@ -320,7 +318,7 @@ void loop() {
     Serial.print("CH");
     Serial.print(i + 1);
     Serial.print(":");
-    
+
     // Print short name (e.g. "4.7k" or "NONE") aligned to exactly 5 characters
     // Uses the debounced stableIndex, not the raw instantaneous detectedIndex.
     const char* name = getResistorName(stableIndex[i]);
@@ -334,14 +332,8 @@ void loop() {
     print4DigitMV(normalizedMV);
     Serial.print("mV) ");
     
-    Serial.print(isMatch ? "[OK]" : "[ERR]");
-
-    // TEMP DEBUG: raw unscaled ADC voltage, before auto-calibration scaling is applied.
-    // Useful for confirming a physical connection change is actually reaching the pin.
-    Serial.print(" raw:");
-    print4DigitMV(rawMV);
-    Serial.print("mV");
-
+    Serial.print(isMatch ? "[ OK ]" : "[ERR ]");
+    
     if (i < 2) {
       Serial.print(" | ");
     }
