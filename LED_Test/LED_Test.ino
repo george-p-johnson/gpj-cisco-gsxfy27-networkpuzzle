@@ -1,15 +1,17 @@
 // --- Pin Definitions ---
 // LED 1
-const int RED_1   = 35;
-const int GREEN_1 = 34;
+// NOTE: GPIO 33-37 are reserved for octal PSRAM on the ESP32-S3R8 and cannot
+// be used as GPIO, so LED 1 uses 42/41 instead.
+const int RED_1   = 34;
+const int GREEN_1 = 35;
 
 // LED 2
-const int RED_2   = 48;
-const int GREEN_2 = 47;
+const int RED_2   = 47;
+const int GREEN_2 = 48;
 
 // LED 3
-const int RED_3   = 39;
-const int GREEN_3 = 38;
+const int RED_3   = 38;
+const int GREEN_3 = 39;
 
 // Arrays for easy looping
 const int redPins[3]   = {RED_1, RED_2, RED_3};
