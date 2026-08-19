@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
+#include <ETH.h>
 
 enum LEDState { LED_OFF, LED_RED, LED_GREEN, LED_YELLOW };
 
@@ -52,6 +53,34 @@ const int SD_CS   = 4;
 const char* DEVICE_CONFIG_FILE = "/device.cfg";
 const char* ANSWER_TABLE_FILE  = "/answer_table.tsv";
 int deviceIndex = 1; // fallback if SD card / config is missing
+
+// --- ETHERNET / OSC TELEMETRY ---
+// W5500 pins confirmed from Waveshare's own ESP32-S3-ETH wiki. Runs on its
+// own SPI bus (HSPI) -- confirmed working standalone via ETH_Test.ino --
+// separate from the SD card, which owns the default SPI object on GPIO4-7.
+#define ETH_PHY_TYPE ETH_PHY_W5500
+#define ETH_PHY_ADDR 1
+#define ETH_PHY_CS   14
+#define ETH_PHY_IRQ  10
+#define ETH_PHY_RST  9
+#define ETH_SPI_SCK  13
+#define ETH_SPI_MISO 12
+#define ETH_SPI_MOSI 11
+SPIClass ethSPI(HSPI);
+NetworkUDP udp;
+bool ethConnected = false;
+
+// Static IP scheme: this board = 192.168.50.(10 + deviceIndex), e.g. device 4
+// -> 192.168.50.14. Matches the addressing used when validating ETH_Test.ino.
+IPAddress ethGateway(192, 168, 50, 1);
+IPAddress ethSubnet(255, 255, 255, 0);
+IPAddress ethDNS(192, 168, 50, 1);
+
+// Where OSC telemetry gets sent. Defaults to the game controller PC's static
+// IP; overridable per-board via an optional "controller_ip=" line in
+// device.cfg if a board ever needs to report somewhere else.
+IPAddress controllerIP(192, 168, 50, 100);
+const uint16_t OSC_PORT = 9000;
 
 struct SocketChannel {
   int analogPin;
@@ -173,6 +202,35 @@ int loadDeviceIndex() {
     return 1;
   }
   return idx;
+}
+
+// Reads an optional "controller_ip=a.b.c.d" line from device.cfg to override
+// where OSC telemetry gets sent. Leaves controllerIP at its default
+// (192.168.50.100) if the file, key, or value is missing/invalid.
+void loadControllerIP() {
+  File f = SD.open(DEVICE_CONFIG_FILE);
+  if (!f) return; // already warned about this in loadDeviceIndex()
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("controller_ip")) {
+      int eq = line.indexOf('=');
+      if (eq >= 0) {
+        IPAddress parsed;
+        String value = line.substring(eq + 1);
+        value.trim();
+        if (parsed.fromString(value)) {
+          controllerIP = parsed;
+        } else {
+          Serial.print(">> WARNING: could not parse controller_ip value \"");
+          Serial.print(value);
+          Serial.println("\" in device.cfg. Keeping default.");
+        }
+      }
+    }
+  }
+  f.close();
 }
 
 // Reads /answer_table.tsv from the SD card and fills correctAnswers[] with
@@ -342,6 +400,93 @@ void printActiveThresholds() {
   Serial.println("------------------------------------------------------------------------\n");
 }
 
+// --- OSC MESSAGE BUILDING ---
+// Minimal hand-rolled OSC packet encoder (address + int32 args only) so we
+// don't need a third-party OSC library across six boards. OSC wire format:
+// null-padded address string, null-padded ",iii..." type tag string, then
+// each int32 argument big-endian, back to back.
+static size_t oscPad4(size_t len) {
+  return (len + 3) & ~((size_t)3);
+}
+
+static size_t oscAppendString(uint8_t *buf, size_t offset, const char *s) {
+  size_t len = strlen(s);
+  memcpy(buf + offset, s, len);
+  size_t padded = oscPad4(len + 1); // +1 for at least one null terminator
+  for (size_t i = len; i < padded; i++) buf[offset + i] = 0;
+  return offset + padded;
+}
+
+void sendOSCInts(const char *address, const int *values, int count) {
+  uint8_t buf[128];
+  size_t offset = oscAppendString(buf, 0, address);
+
+  char typeTags[16];
+  typeTags[0] = ',';
+  for (int i = 0; i < count; i++) typeTags[1 + i] = 'i';
+  typeTags[1 + count] = '\0';
+  offset = oscAppendString(buf, offset, typeTags);
+
+  for (int i = 0; i < count; i++) {
+    uint32_t v = (uint32_t)values[i];
+    buf[offset++] = (v >> 24) & 0xFF;
+    buf[offset++] = (v >> 16) & 0xFF;
+    buf[offset++] = (v >> 8) & 0xFF;
+    buf[offset++] = v & 0xFF;
+  }
+
+  udp.beginPacket(controllerIP, OSC_PORT);
+  udp.write(buf, offset);
+  udp.endPacket();
+}
+
+// Sends this board's current state as one OSC message:
+// address "/waveshare/<deviceIndex>", args [ch1Index, ch1Match, ch2Index,
+// ch2Match, ch3Index, ch3Match, allCorrect] -- all ints, matches are 0/1.
+void sendGameStateOSC(const int stableIdx[3], const bool matched[3], bool allCorrect) {
+  if (!ethConnected) return; // fire-and-forget; skip while link/IP isn't up
+
+  String address = "/waveshare/" + String(deviceIndex);
+  int values[7] = {
+    stableIdx[0], matched[0] ? 1 : 0,
+    stableIdx[1], matched[1] ? 1 : 0,
+    stableIdx[2], matched[2] ? 1 : 0,
+    allCorrect ? 1 : 0
+  };
+  sendOSCInts(address.c_str(), values, 7);
+}
+
+void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println(">> ETH Started");
+      ETH.setHostname(("waveshare-" + String(deviceIndex)).c_str());
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println(">> ETH Connected (link up)");
+      break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      Serial.print(">> ETH Got IP: ");
+      Serial.println(ETH.localIP());
+      ethConnected = true;
+      break;
+    case ARDUINO_EVENT_ETH_LOST_IP:
+      Serial.println(">> ETH Lost IP");
+      ethConnected = false;
+      break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      Serial.println(">> ETH Disconnected (link down)");
+      ethConnected = false;
+      break;
+    case ARDUINO_EVENT_ETH_STOP:
+      Serial.println(">> ETH Stopped");
+      ethConnected = false;
+      break;
+    default:
+      break;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);
@@ -379,8 +524,36 @@ void setup() {
     if (!loadAnswersFromSD(deviceIndex)) {
       Serial.println(">> WARNING: Using fallback default correctAnswers[] for any channel not found above.");
     }
+
+    loadControllerIP();
   } else {
     Serial.println(">> WARNING: SD card not found or failed to mount. Using hardcoded default correctAnswers[].");
+  }
+  Serial.println();
+
+  // --- ETHERNET INIT ---
+  // Own SPI bus (HSPI), separate from SD's default SPI object -- confirmed
+  // this combination works via ETH_Test.ino before integrating here. Static
+  // IP is deviceIndex-based, so it must run after the SD block above.
+  Network.onEvent(onEthEvent);
+
+  Serial.println(">> Initializing ETH SPI bus (SCK=13 MISO=12 MOSI=11 CS=14)...");
+  Serial.flush();
+  ethSPI.begin(ETH_SPI_SCK, ETH_SPI_MISO, ETH_SPI_MOSI, ETH_PHY_CS);
+
+  Serial.println(">> ETH.begin() ...");
+  Serial.flush();
+  if (ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST, ethSPI)) {
+    IPAddress ethIP(192, 168, 50, 10 + deviceIndex);
+    ETH.config(ethIP, ethGateway, ethSubnet, ethDNS);
+    Serial.print(">> ETH static IP configured: ");
+    Serial.println(ethIP);
+    Serial.print(">> OSC telemetry target: ");
+    Serial.print(controllerIP);
+    Serial.print(":");
+    Serial.println(OSC_PORT);
+  } else {
+    Serial.println(">> WARNING: ETH.begin() FAILED. Running without network telemetry.");
   }
   Serial.println();
 
@@ -426,6 +599,7 @@ void setup() {
 
 void loop() {
   bool allCorrect = true;
+  bool matched[3] = { false, false, false };
 
   for (int i = 0; i < 3; i++) {
     int rawMV = readPinMV(channels[i].analogPin);
@@ -467,6 +641,7 @@ void loop() {
     }
     setLEDState(channels[i].redPin, channels[i].greenPin, ledState);
 
+    matched[i] = isMatch;
     if (!isMatch) {
       allCorrect = false;
     }
@@ -501,5 +676,8 @@ void loop() {
   }
 
   Serial.println();
+
+  sendGameStateOSC(stableIndex, matched, allCorrect);
+
   delay(300);
 }
