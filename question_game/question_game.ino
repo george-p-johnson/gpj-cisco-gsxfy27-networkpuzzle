@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
 
 enum LEDState { LED_OFF, LED_RED, LED_GREEN, LED_YELLOW };
 
@@ -13,17 +15,43 @@ const int LED_BRIGHTNESS_YELLOW_GREEN = LED_BRIGHTNESS_FULL / 8; // yellow's gre
 const int ANALOG_PINS[3] = { 1, 2, 3 }; 
 
 // --- LED GPIO DEFINITIONS ---
-// CH1 (Socket 1) 
-const int CH1_RED   = 35;
-const int CH1_GREEN = 34;
+// CH1 (Socket 1)
+// NOTE: was originally GPIO35/34, which sit inside Waveshare's documented
+// "GPIO33-37 internally occupied" range (see ESP32-S3-ETH wiki FAQ) -- driving
+// those as outputs was corrupting state that later crashed SD.begin() with an
+// Interrupt WDT panic (confirmed independently on both 34 and 35). Moved to
+// GPIO42/45 -- neither overlaps SD, Ethernet, analog inputs, the other
+// channels' LEDs, or the bad 33-37 range.
+const int CH1_RED   = 45;
+const int CH1_GREEN = 42;
 
 // CH2 (Socket 2) 
 const int CH2_RED   = 48;
 const int CH2_GREEN = 47;
 
-// CH3 (Socket 3) 
+// CH3 (Socket 3)
 const int CH3_RED   = 39;
 const int CH3_GREEN = 38;
+
+// --- SD CARD PIN DEFINITIONS ---
+// Waveshare ESP32-S3-ETH onboard TF card slot. Uses the default global SPI
+// object (not a separately-hosted SPIClass) -- an explicit SPIClass(FSPI)
+// instance was found to hang SD.begin() on this board, even though the pins
+// and card were confirmed good via an isolated test with the default object.
+const int SD_SCK  = 7;
+const int SD_MISO = 5;
+const int SD_MOSI = 6;
+const int SD_CS   = 4;
+
+// --- MULTI-DEVICE CONFIG (SAME FIRMWARE, SIX PHYSICAL BOARDS) ---
+// Each board's SD card carries a small device.cfg naming which of the six
+// Waveshare units it is (1-6). That index selects which 3 rows of
+// answer_table.tsv (also copied onto the SD card) become this board's
+// correctAnswers[]. Devices 1/2 serve panel P1 (questions 1-3 / 4-6),
+// devices 3/4 serve panel P2, devices 5/6 serve panel P3.
+const char* DEVICE_CONFIG_FILE = "/device.cfg";
+const char* ANSWER_TABLE_FILE  = "/answer_table.tsv";
+int deviceIndex = 1; // fallback if SD card / config is missing
 
 struct SocketChannel {
   int analogPin;
@@ -96,12 +124,117 @@ const char* getResistorName(int idx) {
 // --- GAME ANSWER CONFIGURATION ---
 // Index mappings correspond to nominalRanges above:
 // 0=470R, 1=1k, 2=2.2k, 3=4.7k, 4=10k, 5=22k, 6=33k, 7=47k, 8=68k, 9=100k, 10=NONE
-// Set the correct answer resistor index for each question socket (CH1, CH2, CH3)
+// These are only the fallback/bench-test values used when no SD card (or no
+// answer_table.tsv match) is found. Normally this array is overwritten at
+// boot by loadAnswersFromSD() based on this board's device.cfg index.
 int correctAnswers[3] = {
   3,  // CH1 correct answer is 4.7k Ohm (Index 3)
   7,  // CH2 correct answer is 47k Ohm  (Index 7)
   5   // CH3 correct answer is 22k Ohm  (Index 5)
 };
+
+// Works out which 3 question IDs (e.g. "P1q1", "P1q2", "P1q3") this board
+// is responsible for, given its device.cfg index (1-6).
+void computeQuestionIDs(int devIdx, String qIDs[3]) {
+  int zeroBased = devIdx - 1;           // 0..5
+  int panel = zeroBased / 2 + 1;        // 1,1,2,2,3,3
+  int startQ = (zeroBased % 2) * 3 + 1; // 1 or 4
+  for (int i = 0; i < 3; i++) {
+    qIDs[i] = "P" + String(panel) + "q" + String(startQ + i);
+  }
+}
+
+// Reads /device.cfg (key=value, e.g. "waveshare_index=3") from the SD card.
+// Falls back to 1 and logs a warning if the file, key, or value is invalid.
+int loadDeviceIndex() {
+  File f = SD.open(DEVICE_CONFIG_FILE);
+  if (!f) {
+    Serial.print(">> WARNING: Could not open ");
+    Serial.print(DEVICE_CONFIG_FILE);
+    Serial.println(". Defaulting to waveshare_index=1.");
+    return 1;
+  }
+
+  int idx = -1;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("waveshare_index")) {
+      int eq = line.indexOf('=');
+      if (eq >= 0) {
+        idx = line.substring(eq + 1).toInt();
+      }
+    }
+  }
+  f.close();
+
+  if (idx < 1 || idx > 6) {
+    Serial.println(">> WARNING: waveshare_index missing or out of range [1-6] in device.cfg. Defaulting to 1.");
+    return 1;
+  }
+  return idx;
+}
+
+// Reads /answer_table.tsv from the SD card and fills correctAnswers[] with
+// the "index" column of the 3 rows matching this device's question IDs.
+// Returns true only if all 3 rows were found.
+bool loadAnswersFromSD(int devIdx) {
+  String qIDs[3];
+  computeQuestionIDs(devIdx, qIDs);
+  bool found[3] = { false, false, false };
+
+  File f = SD.open(ANSWER_TABLE_FILE);
+  if (!f) {
+    Serial.print(">> WARNING: Could not open ");
+    Serial.print(ANSWER_TABLE_FILE);
+    Serial.println(" on SD card.");
+    return false;
+  }
+
+  f.readStringUntil('\n'); // skip header row (question, answer, ohms, index)
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int tab1 = line.indexOf('\t');
+    int tab2 = line.indexOf('\t', tab1 + 1);
+    int tab3 = line.indexOf('\t', tab2 + 1);
+    if (tab1 < 0 || tab2 < 0 || tab3 < 0) continue; // malformed row, skip
+
+    String question = line.substring(0, tab1);
+    String idxStr = line.substring(tab3 + 1);
+    idxStr.trim();
+
+    for (int i = 0; i < 3; i++) {
+      if (!found[i] && question == qIDs[i]) {
+        correctAnswers[i] = idxStr.toInt();
+        found[i] = true;
+      }
+    }
+  }
+  f.close();
+
+  Serial.println(">> Device question assignments:");
+  for (int i = 0; i < 3; i++) {
+    Serial.print("   CH");
+    Serial.print(i + 1);
+    Serial.print(" = ");
+    Serial.print(qIDs[i]);
+    if (found[i]) {
+      Serial.print("  -> answer index ");
+      Serial.print(correctAnswers[i]);
+      Serial.print(" (");
+      Serial.print(getResistorName(correctAnswers[i]));
+      Serial.println(")");
+    } else {
+      Serial.println("  -> NOT FOUND in answer_table.tsv (keeping fallback default)");
+    }
+  }
+
+  return found[0] && found[1] && found[2];
+}
 
 int getComputedThreshold(int idx) {
   if (idx < 0 || idx >= 9) return 2921; // fallback
@@ -227,6 +360,29 @@ void setup() {
   Serial.println("\n========================================================================");
   Serial.println("         RESISTOR MATCH GAME: MULTI-CHANNEL QUESTION & ANSWER           ");
   Serial.println("========================================================================\n");
+
+  // --- SD CARD CONFIG LOAD ---
+  // Same firmware runs on all six boards; each board's SD card tells it
+  // which device it is (device.cfg) and supplies the shared answer_table.tsv
+  // it reads its 3 correct answers from.
+  Serial.println(">> Initializing SD SPI bus (SCK=7 MISO=5 MOSI=6 CS=4)...");
+  Serial.flush();
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  Serial.println(">> Mounting SD card...");
+  Serial.flush();
+  if (SD.begin(SD_CS)) {
+    deviceIndex = loadDeviceIndex();
+    Serial.print(">> Waveshare device index: ");
+    Serial.println(deviceIndex);
+
+    if (!loadAnswersFromSD(deviceIndex)) {
+      Serial.println(">> WARNING: Using fallback default correctAnswers[] for any channel not found above.");
+    }
+  } else {
+    Serial.println(">> WARNING: SD card not found or failed to mount. Using hardcoded default correctAnswers[].");
+  }
+  Serial.println();
 
   // --- BOOT-TIME GLOBAL ADC SCAN ---
   // If the user starts the board with patch cords already plugged in, we scan for 

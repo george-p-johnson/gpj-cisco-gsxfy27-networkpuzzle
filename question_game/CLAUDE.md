@@ -121,11 +121,13 @@ The system relies on three discrete analog inputs and six digital output pins ma
 
 | Channel | physical Socket | ESP32-S3 Pin | LED RED GPIO | LED GREEN GPIO | Physical Header Pins & Location |
 | :---: | :---: | :---: | :---: | :---: | :--- |
-| **CH1** | Socket 1 | **GPIO 1** | **GPIO 16** | **GPIO 17** | Left Header Pins 32, 34 |
+| **CH1** | Socket 1 | **GPIO 1** | **GPIO 45** | **GPIO 42** | *(pending verification -- moved off GPIO34/35, which are internally reserved on this board; see FAQ note below)* |
 | **CH2** | Socket 2 | **GPIO 2** | **GPIO 38** | **GPIO 39** | Right Header Pins 14, 12 |
 | **CH3** | Socket 3 | **GPIO 3** | **GPIO 34** | **GPIO 35** | Right Header Pins 19, 17 |
 
 *Note: LED pins output digital `HIGH` to switch the selected color ON, and `LOW` to switch it OFF. Red and Green pins are operated mutually-exclusively per channel.*
+
+*Note: GPIO33-37 are internally occupied on this board (Waveshare's ESP32-S3-ETH FAQ; believed to be Octal PSRAM data lines) and must not be driven as outputs. CH1 was originally wired to GPIO34/35, which are inside that range -- driving them corrupted state that crashed the SD card driver. Confirmed independently on both pins before moving CH1 to GPIO45/42.*
 
 ---
 
