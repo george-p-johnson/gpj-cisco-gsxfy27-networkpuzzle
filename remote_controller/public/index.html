@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Network Puzzle Remote</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Network Puzzle Remote</h1>
+    <div class="status" id="status">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Connecting&hellip;</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="game-state" id="gameState">
+      <span class="game-state-label">Game State</span>
+      <span class="game-state-value" id="gameStateValue">&mdash;</span>
+    </section>
+
+    <section class="players">
+      <button class="player-btn" data-player="1">
+        <span class="label">Player 1</span>
+        <span class="state">OFF</span>
+      </button>
+      <button class="player-btn" data-player="2">
+        <span class="label">Player 2</span>
+        <span class="state">OFF</span>
+      </button>
+      <button class="player-btn" data-player="3">
+        <span class="label">Player 3</span>
+        <span class="state">OFF</span>
+      </button>
+    </section>
+
+    <section class="primary-actions">
+      <button class="pulse-btn start" data-action="start_game">Start Game</button>
+      <button class="pulse-btn reset" data-action="reset_game">Reset Game</button>
+    </section>
+  </main>
+
+  <footer>
+    <button class="menu-toggle" id="menuToggle" aria-expanded="false">
+      More options <span class="chevron">&#9662;</span>
+    </button>
+    <div class="menu" id="menu" hidden>
+      <button class="pulse-btn secondary" data-action="open_monitors">Open Monitors</button>
+      <button class="pulse-btn secondary" data-action="reset_best_time">Reset Best Time</button>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

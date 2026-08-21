@@ -1,0 +1,85 @@
+# Remote Controller
+
+A small web app for operating the GSXFY27 Network Puzzle game from a phone,
+tablet, or laptop on the same network as the show PC.
+
+- 3 toggle buttons: **Activate Player 1 / 2 / 3** (only enabled while the game state is Idle)
+- 2 pulse buttons: **Start Game** (only enabled while the game state is Idle), **Reset Game**
+- A **More options** menu with 2 hidden pulse buttons: **Open Monitors**,
+  **Reset Best Time**
+- A live **Connected / Disconnected** indicator for the link to TouchDesigner
+- A live **game state** display (Idle / Three / Two / One / Start / Gameplay / Results)
+
+It runs as a small Node.js server on the same Windows PC as TouchDesigner:
+the server hosts the control page over plain HTTP/WebSocket for any device
+on the LAN, and separately speaks OSC/UDP to TouchDesigner (matching the
+OSC convention the ESP32 boards already use, on different ports so it never
+touches port 9000).
+
+```
+Browser  <--WebSocket-->  Node server  <--OSC/UDP-->  TouchDesigner
+(any LAN device)          (this PC)                    (this PC)
+```
+
+## Setup
+
+```bash
+npm install
+cp .env.example .env
+```
+
+Edit `.env` if you want a different HTTP port (default `8080`) or different
+OSC ports. See [`.env.example`](.env.example) for all options.
+
+## Run
+
+```bash
+npm start
+```
+
+The console prints the URLs to use:
+
+```
+Local:   http://localhost:8080
+Network: http://192.168.x.x:8080
+```
+
+Open the `Network` URL from any phone/tablet/laptop on the same network as
+the show PC.
+
+## TouchDesigner side
+
+See [`touchdesigner/SETUP.md`](touchdesigner/SETUP.md) for the OSC In DAT /
+DAT Execute / heartbeat wiring needed inside the `.toe` to receive commands
+and report connection status back.
+
+## Message reference
+
+| UI action | OSC address (Remote → TD) | Value |
+| --- | --- | --- |
+| Toggle Player 1/2/3 | `/remote/player/1`, `/2`, `/3` | `1` = on, `0` = off |
+| Start Game | `/remote/start_game` | `1` |
+| Reset Game | `/remote/reset_game` | `1` |
+| Open Monitors | `/remote/open_monitors` | `1` |
+| Reset Best Time | `/remote/reset_best_time` | `1` |
+
+| TD → Remote | OSC address | Purpose |
+| --- | --- | --- |
+| Heartbeat | `/remote/heartbeat` | Sent ~every 1s; drives Connected/Disconnected |
+| Game state | `/remote/game_state` | Int `1`-`7`; drives the game-state display |
+
+Game state values:
+
+| Value | State |
+| :---: | --- |
+| 1 | Idle |
+| 2 | Three |
+| 3 | Two |
+| 4 | One |
+| 5 | Start |
+| 6 | Gameplay |
+| 7 | Results |
+
+Toggle state and the last-known game state are held centrally on the Node
+server, so every connected browser stays in sync if more than one person
+has the page open.
