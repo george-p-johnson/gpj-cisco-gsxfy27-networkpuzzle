@@ -27,33 +27,43 @@ Both `.env`-configurable defaults live in [`../.env.example`](../.env.example).
 Each row it outputs has an `address` column like `/remote/player/1` and an
 `args` column with the value.
 
-## 2. Dispatch commands: DAT Execute
+## 2. Dispatch commands: Callbacks DAT (not DAT Execute)
 
-Add a **DAT Execute DAT**, point it at `oscin1`, enable **Row Change**, and
-use something like:
+**Use `oscin1`'s own `Callbacks DAT` (`onReceiveOSC`), not a `DAT Execute`
+watching its table.** An earlier version of this doc recommended a
+`DAT Execute` looping over `oscin1`'s rows on every table change -- that
+pattern is broken for a live command stream: if the OSC In DAT retains more
+than one row (which it does by default), every new incoming message causes
+the loop to *re-process every old row still sitting in the table too*, so a
+stale command from minutes ago can fire again alongside a brand new one.
+This was actually hit and confirmed live: toggling a player replayed an old
+`start_game` command. `onReceiveOSC` fires exactly once per real incoming
+packet, with no table/history involved, so this class of bug can't happen.
+
+Select `oscin1` → find its `Callbacks DAT` parameter → create one (this
+generates a template with the correct `onReceiveOSC` signature for your TD
+build) → fill it in:
 
 ```python
-# DAT Execute callback, watching oscin1
+# oscin1's Callbacks DAT
 
-def onTableChange(dat):
-    for row in range(1, dat.numRows):
-        address = dat[row, 'address'].val
-        value = int(float(dat[row, 'args'].val))
+def onReceiveOSC(dat, rowIndex, message, bytes, timeStamp, address, args, peer):
+    value = int(args[0]) if args else 0
 
-        if address == '/remote/player/1':
-            set_player_active(1, value)
-        elif address == '/remote/player/2':
-            set_player_active(2, value)
-        elif address == '/remote/player/3':
-            set_player_active(3, value)
-        elif address == '/remote/start_game':
-            start_game()
-        elif address == '/remote/reset_game':
-            reset_game()
-        elif address == '/remote/open_monitors':
-            open_monitors()
-        elif address == '/remote/reset_best_time':
-            reset_best_time()
+    if address == '/remote/player/1':
+        set_player_active(1, value)
+    elif address == '/remote/player/2':
+        set_player_active(2, value)
+    elif address == '/remote/player/3':
+        set_player_active(3, value)
+    elif address == '/remote/start_game':
+        start_game()
+    elif address == '/remote/reset_game':
+        reset_game()
+    elif address == '/remote/open_monitors':
+        open_monitors()
+    elif address == '/remote/reset_best_time':
+        reset_best_time()
     return
 
 
@@ -84,7 +94,13 @@ def reset_best_time():
 
 Pulse-type commands (`start_game`, `reset_game`, `open_monitors`,
 `reset_best_time`) always arrive with value `1` — there's no explicit "off"
-message, treat receipt of the row as the pulse itself.
+message, treat receipt of the message as the pulse itself.
+
+Reset Game additionally causes the remote server to send up to three more
+`/remote/player/<n>` messages right after it (staggered ~150ms apart, see
+`PLAYER_ACTIVATE_STAGGER_MS` in `.env`) — it auto-activates any player that
+wasn't already ON. No special handling needed here: they arrive as ordinary
+`/remote/player/<n>` messages through the same callback above.
 
 ## 3. Send status back: OSC Out DAT + a Timer/Execute
 

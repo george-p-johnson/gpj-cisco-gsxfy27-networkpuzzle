@@ -4,7 +4,7 @@ A small web app for operating the GSXFY27 Network Puzzle game from a phone,
 tablet, or laptop on the same network as the show PC.
 
 - 3 toggle buttons: **Activate Player 1 / 2 / 3** (only enabled while the game state is Idle)
-- 2 pulse buttons: **Start Game** (only enabled while the game state is Idle), **Reset Game**
+- 2 pulse buttons: **Start Game** (only enabled while the game state is Idle *and* at least one player is active), **Reset Game** (also auto-activates any player not already ON, so a fresh reset defaults to all 3 players ready)
 - A **More options** menu with 2 hidden pulse buttons: **Open Monitors**,
   **Reset Best Time**
 - A live **Connected / Disconnected** indicator for the link to TouchDesigner
@@ -51,8 +51,14 @@ the show PC.
 ## TouchDesigner side
 
 See [`touchdesigner/SETUP.md`](touchdesigner/SETUP.md) for the OSC In DAT /
-DAT Execute / heartbeat wiring needed inside the `.toe` to receive commands
-and report connection status back.
+Callbacks DAT / heartbeat wiring needed inside the `.toe` to receive
+commands and report connection status back.
+
+## Show PC deployment
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for how this is made reachable from
+outside the LAN (Cloudflare Tunnel, `https://gsxnetworkpuzzle.com`) and how
+the show PC autostarts everything (`../start_show.bat` + Task Scheduler).
 
 ## Message reference
 
@@ -63,6 +69,11 @@ and report connection status back.
 | Reset Game | `/remote/reset_game` | `1` |
 | Open Monitors | `/remote/open_monitors` | `1` |
 | Reset Best Time | `/remote/reset_best_time` | `1` |
+
+Reset Game also triggers up to three additional `/remote/player/<n>` = `1`
+messages right after it (staggered `PLAYER_ACTIVATE_STAGGER_MS` apart, see
+`.env.example`) — one for each player not already active, so TD sees the
+same activation messages it would if someone had toggled them by hand.
 
 | TD → Remote | OSC address | Purpose |
 | --- | --- | --- |
