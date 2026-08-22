@@ -11,6 +11,7 @@ const TD_HOST = process.env.TD_HOST || '127.0.0.1';
 const TD_OSC_SEND_PORT = Number(process.env.TD_OSC_SEND_PORT || 9001);
 const TD_OSC_LISTEN_PORT = Number(process.env.TD_OSC_LISTEN_PORT || 9002);
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 3000);
+const PLAYER_ACTIVATE_STAGGER_MS = Number(process.env.PLAYER_ACTIVATE_STAGGER_MS || 150);
 
 if (HTTP_PORT === 9000) {
   console.error('HTTP_PORT cannot be 9000 -- that port is reserved for ESP32 board OSC telemetry.');
@@ -33,6 +34,7 @@ const state = {
   players: { 1: false, 2: false, 3: false },
   connected: false,
   gameState: null,
+  waveshare: { 1: false, 2: false, 3: false, 4: false, 5: false, 6: false },
 };
 
 // ---- OSC link to TouchDesigner ---------------------------------------
@@ -63,6 +65,8 @@ function oscArgValue(msg, index) {
   return arg && typeof arg === 'object' ? arg.value : arg;
 }
 
+const WAVESHARE_ADDR_RE = /^\/remote\/waveshare\/([1-6])$/;
+
 oscPort.on('message', (msg) => {
   if (msg.address === '/remote/heartbeat') {
     markConnected(true);
@@ -72,6 +76,16 @@ oscPort.on('message', (msg) => {
     if (GAME_STATE_NAMES[value] && value !== state.gameState) {
       state.gameState = value;
       broadcastState();
+    }
+  } else {
+    const waveshareMatch = msg.address.match(WAVESHARE_ADDR_RE);
+    if (waveshareMatch) {
+      const board = Number(waveshareMatch[1]);
+      const live = Boolean(Number(oscArgValue(msg, 0)));
+      if (state.waveshare[board] !== live) {
+        state.waveshare[board] = live;
+        broadcastState();
+      }
     }
   }
 });
@@ -120,6 +134,7 @@ function currentStateMessage() {
     connected: state.connected,
     gameState: state.gameState,
     gameStateLabel: GAME_STATE_NAMES[state.gameState] || null,
+    waveshare: state.waveshare,
   });
 }
 
@@ -151,8 +166,26 @@ wss.on('connection', (ws) => {
       sendOSC(`/remote/player/${msg.player}`, next);
       broadcastState();
     } else if (msg.type === 'pulse' && VALID_PULSES.has(msg.action)) {
-      if (msg.action === 'start_game' && state.gameState !== IDLE_STATE) return;
+      if (msg.action === 'start_game') {
+        if (state.gameState !== IDLE_STATE) return;
+        if (!Object.values(state.players).some(Boolean)) return;
+      }
       sendOSC(`/remote/${msg.action}`, 1);
+
+      if (msg.action === 'reset_game') {
+        const playersToActivate = [1, 2, 3].filter((player) => !state.players[player]);
+        for (const player of playersToActivate) {
+          state.players[player] = true;
+        }
+        if (playersToActivate.length > 0) broadcastState();
+
+        // Staggered rather than fired back-to-back: TD's OSC In DAT/CHOP
+        // processes on its own frame cadence, and multiple UDP packets
+        // arriving within the same frame can get coalesced or dropped.
+        playersToActivate.forEach((player, i) => {
+          setTimeout(() => sendOSC(`/remote/player/${player}`, true), i * PLAYER_ACTIVATE_STAGGER_MS);
+        });
+      }
     }
   });
 });

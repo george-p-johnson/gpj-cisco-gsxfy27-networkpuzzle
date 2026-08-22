@@ -9,6 +9,7 @@ tablet, or laptop on the same network as the show PC.
   **Reset Best Time**
 - A live **Connected / Disconnected** indicator for the link to TouchDesigner
 - A live **game state** display (Idle / Three / Two / One / Start / Gameplay / Results)
+- A live **Boards** indicator showing which of the 6 ESP32 question boards are currently reporting, grouped by panel
 
 It runs as a small Node.js server on the same Windows PC as TouchDesigner:
 the server hosts the control page over plain HTTP/WebSocket for any device
@@ -67,6 +68,7 @@ and report connection status back.
 | --- | --- | --- |
 | Heartbeat | `/remote/heartbeat` | Sent ~every 1s; drives Connected/Disconnected |
 | Game state | `/remote/game_state` | Int `1`-`7`; drives the game-state display |
+| Board status | `/remote/waveshare/1` ... `/remote/waveshare/6` | `1` = board reporting recently, `0` = stale/offline; drives the Boards indicator |
 
 Game state values:
 

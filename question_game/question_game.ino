@@ -68,6 +68,7 @@ int deviceIndex = 1; // fallback if SD card / config is missing
 #define ETH_SPI_MOSI 11
 SPIClass ethSPI(HSPI);
 NetworkUDP udp;
+uint32_t heartbeatCounter = 0; // increments every telemetry send, regardless of game state, so a listener can detect a live board even when its readings aren't changing
 bool ethConnected = false;
 
 // Static IP scheme: this board = 192.168.50.(10 + deviceIndex), e.g. device 4
@@ -81,6 +82,12 @@ IPAddress ethDNS(192, 168, 50, 1);
 // device.cfg if a board ever needs to report somewhere else.
 IPAddress controllerIP(192, 168, 50, 100);
 const uint16_t OSC_PORT = 9000;
+
+// Incoming game-state channel (TD -> boards). TD broadcasts the current
+// game state to 192.168.50.255 on this port; every board listens and reacts
+// with lighting effects (see applyGameStateLighting() below).
+const uint16_t STATE_LISTEN_PORT = 9003;
+int currentGameState = 1; // 1 = Idle, matches the same 1-7 convention used elsewhere; safe default until TD sends real state
 
 struct SocketChannel {
   int analogPin;
@@ -442,18 +449,63 @@ void sendOSCInts(const char *address, const int *values, int count) {
 
 // Sends this board's current state as one OSC message:
 // address "/waveshare/<deviceIndex>", args [ch1Index, ch1Match, ch2Index,
-// ch2Match, ch3Index, ch3Match, allCorrect] -- all ints, matches are 0/1.
+// ch2Match, ch3Index, ch3Match, allCorrect, heartbeat] -- all ints, matches
+// are 0/1. `heartbeat` increments on every send (wrapping is fine) so a
+// listener can tell the board is alive even during stretches where none of
+// the other values change.
 void sendGameStateOSC(const int stableIdx[3], const bool matched[3], bool allCorrect) {
   if (!ethConnected) return; // fire-and-forget; skip while link/IP isn't up
 
   String address = "/waveshare/" + String(deviceIndex);
-  int values[7] = {
+  int values[8] = {
     stableIdx[0], matched[0] ? 1 : 0,
     stableIdx[1], matched[1] ? 1 : 0,
     stableIdx[2], matched[2] ? 1 : 0,
-    allCorrect ? 1 : 0
+    allCorrect ? 1 : 0,
+    (int)(heartbeatCounter++)
   };
-  sendOSCInts(address.c_str(), values, 7);
+  sendOSCInts(address.c_str(), values, 8);
+}
+
+// Checks for an incoming "/game_state" OSC message (one int32 arg, the same
+// 1-7 convention as everything else: 1=Idle 2=Three 3=Two 4=One 5=Start
+// 6=Gameplay 7=Results) and updates currentGameState if one arrived.
+// Minimal parse to match the minimal encoder above -- no third-party OSC lib.
+void checkForStateUpdate() {
+  int packetSize = udp.parsePacket();
+  if (packetSize <= 0) return;
+
+  uint8_t inBuf[64];
+  int len = udp.read(inBuf, sizeof(inBuf) - 1);
+  if (len <= 0) return;
+  inBuf[len] = 0;
+
+  if (strcmp((char*)inBuf, "/game_state") != 0) return;
+  size_t offset = oscPad4(strlen((char*)inBuf) + 1);
+  if (offset + 4 > (size_t)len) return;
+
+  const char* typeTag = (char*)(inBuf + offset);
+  if (typeTag[0] != ',' || typeTag[1] != 'i') return;
+  offset += oscPad4(strlen(typeTag) + 1);
+  if (offset + 4 > (size_t)len) return;
+
+  uint32_t v = ((uint32_t)inBuf[offset] << 24) | ((uint32_t)inBuf[offset + 1] << 16) |
+               ((uint32_t)inBuf[offset + 2] << 8) | (uint32_t)inBuf[offset + 3];
+  currentGameState = (int)v;
+}
+
+// Decides this channel's LED for the current game state:
+// - Idle / Start: always off, regardless of what's plugged in.
+// - Three / Two / One: a countdown -- lights up one more channel red per
+//   step (CH1 only -> CH1+CH2 -> all three), independent of actual readings.
+// - Gameplay / Results: reflects real connection data (handled by the
+//   caller, which already has isConnected/isMatch/isDeciding computed).
+LEDState countdownOrIdleLEDState(int channelIndex) {
+  if (currentGameState == 2 || currentGameState == 3 || currentGameState == 4) {
+    int litCount = currentGameState - 1; // Three->1, Two->2, One->3
+    return (channelIndex < litCount) ? LED_RED : LED_OFF;
+  }
+  return LED_OFF; // Idle, Start, or anything unrecognized
 }
 
 void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
@@ -552,6 +604,9 @@ void setup() {
     Serial.print(controllerIP);
     Serial.print(":");
     Serial.println(OSC_PORT);
+    udp.begin(STATE_LISTEN_PORT);
+    Serial.print(">> Listening for game-state broadcasts on UDP ");
+    Serial.println(STATE_LISTEN_PORT);
   } else {
     Serial.println(">> WARNING: ETH.begin() FAILED. Running without network telemetry.");
   }
@@ -598,6 +653,8 @@ void setup() {
 }
 
 void loop() {
+  checkForStateUpdate();
+
   bool allCorrect = true;
   bool matched[3] = { false, false, false };
 
@@ -635,9 +692,16 @@ void loop() {
     // stable classification, so keep the LED off instead of jumping to red/green.
     bool isDeciding = (detectedIndex != stableIndex[i]);
 
-    LEDState ledState = LED_OFF;
-    if (!isDeciding && isConnected) {
-      ledState = isMatch ? LED_GREEN : LED_RED;
+    LEDState ledState;
+    if (currentGameState == 6 || currentGameState == 7) {
+      // Gameplay / Results: reflect actual connection data.
+      ledState = LED_OFF;
+      if (!isDeciding && isConnected) {
+        ledState = isMatch ? LED_GREEN : LED_RED;
+      }
+    } else {
+      // Idle / Three / Two / One / Start: lighting is state-driven, not reading-driven.
+      ledState = countdownOrIdleLEDState(i);
     }
     setLEDState(channels[i].redPin, channels[i].greenPin, ledState);
 

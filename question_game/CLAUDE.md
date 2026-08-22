@@ -12,10 +12,11 @@ The installation is **six physical Waveshare ESP32-S3-ETH boards, all running th
 * **Continuous Scanning:** The microcontroller continuously scans the three question sockets to identify which answer resistor (if any) is currently connected.
 * **Match Indicator LEDs:** Each channel has a dedicated bi-color LED:
   - **Green LED:** Illuminates when the patch cord connects a question socket to its **correct** answer socket (as defined by that board's configuration).
-  - **Red LED:** Illuminates if the patch cord is connected to an **incorrect** answer socket, or is **unplugged** (open circuit).
+  - **Red LED:** Illuminates if the patch cord is connected to an **incorrect** answer socket. An **unplugged** (open circuit) socket shows **off**, not red -- see Section 8B.
+  - LED behavior above applies during **Gameplay**/**Results**; during **Idle**/**Three**/**Two**/**One**/**Start** the LEDs instead follow the countdown/lighting sequence driven by the controller (Section 7D, Section 8B), independent of what's actually plugged in.
 * **Game Victory State:** A per-board success signal is triggered only when all three channels have correct matches simultaneously.
 * **Variable Configurations:** Correct answers are not hardcoded in the firmware. Each board reads its assigned questions and their correct answers from a shared `answer_table.tsv` on its SD card, selecting the right 3 rows based on a `device.cfg` file that names which of the six boards it is. This means the entire installation's questions can be re-authored by editing one spreadsheet-like file and copying it to six SD cards -- no reflashing, no hardware rewiring. See **Section 6**.
-* **Networked Telemetry:** Each board reports its live channel states to a central game controller (TouchDesigner) over Ethernet via OSC. See **Section 7**.
+* **Networked Telemetry (Two-Way):** Each board reports its live channel states to a central game controller (TouchDesigner) over Ethernet via OSC, and also receives the current game state back from the controller to drive its lighting. See **Section 7**.
 
 ---
 
@@ -255,7 +256,7 @@ Sent once per `loop()` iteration (~every 300ms) once the Ethernet link is up. Fi
 
 * **Address:** `/waveshare/<waveshare_index>` (e.g. `/waveshare/4`)
 * **Port:** `9000` (destination), sent to `controllerIP` (default `192.168.50.100`, overridable via `device.cfg`'s `controller_ip`)
-* **Args (7 int32, in order):**
+* **Args (8 int32, in order):**
 
 | # | Arg | Meaning |
 | :---: | :--- | :--- |
@@ -266,6 +267,7 @@ Sent once per `loop()` iteration (~every 300ms) once the Ethernet link is up. Fi
 | 5 | `ch3Index` | CH3's classification |
 | 6 | `ch3Match` | `1` if CH3 matches |
 | 7 | `allCorrect` | `1` only when all three channels are matched simultaneously (this board's puzzle solved) |
+| 8 | `heartbeat` | Increments on every send (wraps, don't rely on the exact value) -- always changes even when args 1-7 don't, so a listener can distinguish "board alive, unchanged reading" from "board gone" |
 
 The OSC packet encoder is hand-rolled (`sendOSCInts()` in `question_game.ino`) rather than a third-party library, to avoid an extra dependency across six boards. It only supports int32 args, which is all this project currently needs.
 
@@ -274,8 +276,26 @@ The OSC packet encoder is hand-rolled (`sendOSCInts()` in `question_game.ino`) r
 * `ETH.begin()` happens in `setup()`, **after** the SD card block, because the static IP depends on `deviceIndex` having already been loaded.
 * `ethConnected` is tracked via the `Network.onEvent()` callback (`ARDUINO_EVENT_ETH_GOT_IP` / `..._LOST_IP` / `..._DISCONNECTED`) and gates whether `sendGameStateOSC()` actually sends -- avoids trying to send before the link is ready.
 
-### D. Currently One-Way (Board → Controller Only)
-The board does not currently listen for incoming UDP/OSC from TouchDesigner. Adding a return channel (e.g. live-reconfiguring answers, forcing LED effects, or a heartbeat check) is possible -- `NetworkUDP` supports binding a listen port on the same socket -- but hasn't been built yet, pending a decision on what commands the controller side actually needs to send.
+### D. Controller → Board: Game-State Lighting
+Boards also **listen** for incoming UDP: TouchDesigner broadcasts the current game state to `192.168.50.255:9003`, and each board reacts by driving its LEDs per Section 8B. This reuses the same `udp` object as outgoing telemetry (`udp.begin(STATE_LISTEN_PORT)` in `setup()`, once Ethernet is up) -- `NetworkUDP` supports simultaneous send (`beginPacket`/`write`/`endPacket`) and receive (`parsePacket`/`read`) on one instance, no second socket needed.
+
+* **Address:** `/game_state`
+* **Port:** `9003` (UDP), received via broadcast to `192.168.50.255` -- reaches all six boards from a single send, no need to target each board's individual static IP
+* **Args (1 int32):** the game state, using the same 1-7 convention the remote controller uses (see `../remote_controller/README.md`):
+
+| Value | State |
+| :---: | --- |
+| 1 | Idle |
+| 2 | Three |
+| 3 | Two |
+| 4 | One |
+| 5 | Start |
+| 6 | Gameplay |
+| 7 | Results |
+
+`currentGameState` defaults to `1` (Idle) at boot, before TD has sent anything, so a board that hasn't heard from the controller yet shows all LEDs off rather than an undefined state.
+
+Parsing (`checkForStateUpdate()` in `question_game.ino`) is a minimal hand-rolled OSC reader, mirroring the hand-rolled encoder already used for outgoing telemetry -- same reasoning, avoids a third-party OSC library dependency.
 
 ### E. Diagnostic Tool
 [`ETH_Test/ETH_Test.ino`](../ETH_Test/ETH_Test.ino) is a minimal standalone sketch (link up, static IP, no SD/game logic) for validating Ethernet connectivity in isolation -- use this first if network-related symptoms come up again, before assuming the integration code is at fault.
@@ -300,15 +320,17 @@ int correctAnswers[3] = {
 
 ### B. Logic Processing Flow
 On every iteration of the `loop()`:
+0. **Check for a game-state update:** `checkForStateUpdate()` (Section 7D) polls for an incoming `/game_state` broadcast and updates `currentGameState` if one arrived; otherwise it's a no-op and the previous value carries over.
 1. **Reset Victory Tracker:** A boolean flag `allCorrect` is initialized to `true`.
 2. **Channel Polling:** For each channel `i` from `0` to `2`:
    - Measure the smoothed analog voltage ($V_{\text{out}}$) on `ANALOG_PINS[i]` after flushing the charge.
    - Map the voltage value to its resistor classification index `detectedIndex` using the Midpoint Decision boundaries.
    - Apply debounce (Section 3C) to promote `detectedIndex` to `stableIndex[i]`.
-   - Compare `stableIndex[i]` with the target `correctAnswers[i]`.
-   - Update LEDs:
-     - If matched, set Green Pin `HIGH` and Red Pin `LOW`.
-     - If mismatched or unplugged, set Red Pin `HIGH` and Green Pin `LOW`, and toggle `allCorrect = false`.
+   - Compare `stableIndex[i]` with the target `correctAnswers[i]` -- this comparison (`matched[i]`, `allCorrect`) always runs and is always sent in telemetry, regardless of `currentGameState`.
+   - Update LEDs, gated by `currentGameState`:
+     - **Idle / Start:** off, regardless of what's plugged in.
+     - **Three / Two / One:** a countdown, independent of actual readings -- one more channel lights red per step (CH1 only → CH1+CH2 → all three).
+     - **Gameplay / Results:** reflects the real reading -- green if matched, red if plugged but wrong, off if the socket is empty (unplugged) or the classification is still debouncing.
    - Output Serial telemetry details (measured mV, detected resistor name, match status).
 3. **Master Win Assertion:** If `allCorrect` remains `true` after polling all three channels, output the unified game win telemetry (`*** GAME SOLVED: ALL PATCHES CORRECT! ***`).
 4. **OSC Telemetry:** Send this board's current state to the game controller (Section 7B).

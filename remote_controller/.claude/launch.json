@@ -3,12 +3,11 @@
   "configurations": [
     {
       "name": "start",
-      "runtimeExecutable": "npm",
+      "runtimeExecutable": "C:\\Program Files\\nodejs\\node.exe",
       "runtimeArgs": [
-        "run",
-        "start"
+        "server.js"
       ],
-      "port": 3000
+      "port": 8080
     }
   ]
 }

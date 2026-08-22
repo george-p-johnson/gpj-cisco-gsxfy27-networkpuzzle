@@ -6,6 +6,7 @@
   const gameStateEl = document.getElementById('gameState');
   const gameStateValue = document.getElementById('gameStateValue');
   const startBtn = document.querySelector('.pulse-btn.start');
+  const boardStatusEl = document.getElementById('boardStatus');
 
   const IDLE_STATE = 1;
 
@@ -13,6 +14,13 @@
     Array.from(document.querySelectorAll('.player-btn')).map((btn) => [
       Number(btn.dataset.player),
       btn,
+    ])
+  );
+
+  const boardDots = new Map(
+    Array.from(document.querySelectorAll('.board-dot')).map((dot) => [
+      Number(dot.dataset.board),
+      dot,
     ])
   );
 
@@ -36,6 +44,13 @@
     } else {
       statusText.textContent = 'Connecting…';
     }
+    boardStatusEl.classList.toggle('stale', connected !== true);
+  }
+
+  function applyWaveshare(waveshare) {
+    for (const [num, dot] of boardDots) {
+      dot.classList.toggle('live', Boolean(waveshare && waveshare[num]));
+    }
   }
 
   function applyGameState(gameState, gameStateLabel) {
@@ -46,7 +61,6 @@
       gameStateEl.setAttribute('data-state', String(gameState));
       gameStateValue.textContent = gameStateLabel || `State ${gameState}`;
     }
-    startBtn.disabled = gameState !== IDLE_STATE;
     for (const btn of playerButtons.values()) {
       btn.disabled = gameState !== IDLE_STATE;
     }
@@ -58,6 +72,11 @@
       btn.classList.toggle('active', active);
       btn.querySelector('.state').textContent = active ? 'ON' : 'OFF';
     }
+  }
+
+  function updateStartButton(gameState, players) {
+    const anyPlayerActive = Object.values(players || {}).some(Boolean);
+    startBtn.disabled = gameState !== IDLE_STATE || !anyPlayerActive;
   }
 
   function connect() {
@@ -79,6 +98,8 @@
         setStatus(msg.connected);
         applyPlayers(msg.players);
         applyGameState(msg.gameState, msg.gameStateLabel);
+        updateStartButton(msg.gameState, msg.players);
+        applyWaveshare(msg.waveshare);
       }
     });
 
