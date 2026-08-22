@@ -89,6 +89,17 @@ const uint16_t OSC_PORT = 9000;
 const uint16_t STATE_LISTEN_PORT = 9003;
 int currentGameState = 1; // 1 = Idle, matches the same 1-7 convention used elsewhere; safe default until TD sends real state
 
+// Which of the 3 players this board belongs to (1-3), derived from
+// deviceIndex once it's known: boards 1/2 -> P1, 3/4 -> P2, 5/6 -> P3.
+// Set in setup(), right after deviceIndex is finalized.
+int myPlayer = 1;
+
+// Whether each of the 3 players is currently active in the game (a
+// multiplayer variant may not use all three). TD broadcasts this alongside
+// /game_state -- see checkForStateUpdate(). Defaults to all-active so a
+// board's behavior is unchanged until/unless TD actually sends this.
+bool playerActive[3] = { true, true, true };
+
 struct SocketChannel {
   int analogPin;
   int redPin;
@@ -151,6 +162,27 @@ const unsigned long DEBOUNCE_MS = 225;
 int stableIndex[3] = { 10, 10, 10 };           // last accepted (debounced) classification per channel
 int candidateIndex[3] = { 10, 10, 10 };        // classification currently being confirmed
 unsigned long candidateSinceMs[3] = { 0, 0, 0 }; // when candidateIndex[i] first appeared
+
+// --- IDLE "ETHERNET SWITCH" FLICKER ---
+// While idle, each channel's LED randomly flashes green rather than sitting
+// solid, mimicking an Ethernet switch port's link/activity LED. Non-blocking
+// and per-channel independent: each channel rolls its own random on/off
+// duration once its current one elapses, so the three don't flicker in sync.
+bool flickerOn[3] = { false, false, false };
+unsigned long flickerNextToggleMs[3] = { 0, 0, 0 };
+
+void updateIdleFlicker() {
+  unsigned long now = millis();
+  for (int i = 0; i < 3; i++) {
+    if (now >= flickerNextToggleMs[i]) {
+      flickerOn[i] = !flickerOn[i];
+      // Short green flashes against longer off gaps reads like intermittent
+      // traffic rather than a steady blink.
+      unsigned long duration = flickerOn[i] ? random(40, 150) : random(150, 600);
+      flickerNextToggleMs[i] = now + duration;
+    }
+  }
+}
 
 const char* getResistorName(int idx) {
   if (idx >= 0 && idx < 10) return nominalRanges[idx].name;
@@ -467,9 +499,13 @@ void sendGameStateOSC(const int stableIdx[3], const bool matched[3], bool allCor
   sendOSCInts(address.c_str(), values, 8);
 }
 
-// Checks for an incoming "/game_state" OSC message (one int32 arg, the same
-// 1-7 convention as everything else: 1=Idle 2=Three 3=Two 4=One 5=Start
-// 6=Gameplay 7=Results) and updates currentGameState if one arrived.
+// Checks for an incoming OSC message on the shared state-listen port and
+// updates game state accordingly. Two addresses are handled, both broadcast
+// by TD to 192.168.50.255:9003:
+//  - "/game_state"    (1 int32 arg)  -- the same 1-7 convention as
+//    everywhere else: 1=Idle 2=Three 3=Two 4=One 5=Start 6=Gameplay 7=Results
+//  - "/player_active" (3 int32 args) -- p1,p2,p3 active booleans (0/1),
+//    see playerActive[] and boardIdleOverride in loop()
 // Minimal parse to match the minimal encoder above -- no third-party OSC lib.
 void checkForStateUpdate() {
   int packetSize = udp.parsePacket();
@@ -480,32 +516,50 @@ void checkForStateUpdate() {
   if (len <= 0) return;
   inBuf[len] = 0;
 
-  if (strcmp((char*)inBuf, "/game_state") != 0) return;
-  size_t offset = oscPad4(strlen((char*)inBuf) + 1);
+  const char* address = (char*)inBuf;
+  size_t offset = oscPad4(strlen(address) + 1);
   if (offset + 4 > (size_t)len) return;
 
   const char* typeTag = (char*)(inBuf + offset);
-  if (typeTag[0] != ',' || typeTag[1] != 'i') return;
+  if (typeTag[0] != ',') return;
+  int argCount = strlen(typeTag) - 1;
   offset += oscPad4(strlen(typeTag) + 1);
-  if (offset + 4 > (size_t)len) return;
 
-  uint32_t v = ((uint32_t)inBuf[offset] << 24) | ((uint32_t)inBuf[offset + 1] << 16) |
-               ((uint32_t)inBuf[offset + 2] << 8) | (uint32_t)inBuf[offset + 3];
-  currentGameState = (int)v;
+  int values[3];
+  for (int i = 0; i < argCount && i < 3; i++) {
+    if (typeTag[1 + i] != 'i') return;
+    if (offset + 4 > (size_t)len) return;
+    values[i] = (int)(((uint32_t)inBuf[offset] << 24) | ((uint32_t)inBuf[offset + 1] << 16) |
+                       ((uint32_t)inBuf[offset + 2] << 8) | (uint32_t)inBuf[offset + 3]);
+    offset += 4;
+  }
+
+  if (strcmp(address, "/game_state") == 0 && argCount >= 1) {
+    currentGameState = values[0];
+  } else if (strcmp(address, "/player_active") == 0 && argCount >= 3) {
+    playerActive[0] = values[0] != 0;
+    playerActive[1] = values[1] != 0;
+    playerActive[2] = values[2] != 0;
+  }
 }
 
-// Decides this channel's LED for the current game state:
-// - Idle / Start: always off, regardless of what's plugged in.
+// Decides this channel's LED for the current game state (or the effective
+// state, see boardIdleOverride in loop()):
+// - Idle: flickering green, see updateIdleFlicker() above.
+// - Start: off, regardless of what's plugged in.
 // - Three / Two / One: a countdown -- lights up one more channel red per
 //   step (CH1 only -> CH1+CH2 -> all three), independent of actual readings.
 // - Gameplay / Results: reflects real connection data (handled by the
 //   caller, which already has isConnected/isMatch/isDeciding computed).
-LEDState countdownOrIdleLEDState(int channelIndex) {
-  if (currentGameState == 2 || currentGameState == 3 || currentGameState == 4) {
-    int litCount = currentGameState - 1; // Three->1, Two->2, One->3
+LEDState countdownOrIdleLEDState(int channelIndex, int gameState) {
+  if (gameState == 2 || gameState == 3 || gameState == 4) {
+    int litCount = gameState - 1; // Three->1, Two->2, One->3
     return (channelIndex < litCount) ? LED_RED : LED_OFF;
   }
-  return LED_OFF; // Idle, Start, or anything unrecognized
+  if (gameState == 1) {
+    return flickerOn[channelIndex] ? LED_GREEN : LED_OFF;
+  }
+  return LED_OFF; // Start, or anything unrecognized
 }
 
 void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
@@ -581,6 +635,12 @@ void setup() {
   } else {
     Serial.println(">> WARNING: SD card not found or failed to mount. Using hardcoded default correctAnswers[].");
   }
+
+  // Boards 1/2 -> P1, 3/4 -> P2, 5/6 -> P3 -- same panel mapping as
+  // computeQuestionIDs(). Used to decide boardIdleOverride in loop().
+  myPlayer = ((deviceIndex - 1) / 2) + 1;
+  Serial.print(">> This board belongs to player: ");
+  Serial.println(myPlayer);
   Serial.println();
 
   // --- ETHERNET INIT ---
@@ -605,7 +665,7 @@ void setup() {
     Serial.print(":");
     Serial.println(OSC_PORT);
     udp.begin(STATE_LISTEN_PORT);
-    Serial.print(">> Listening for game-state broadcasts on UDP ");
+    Serial.print(">> Listening for game-state / player-active broadcasts on UDP ");
     Serial.println(STATE_LISTEN_PORT);
   } else {
     Serial.println(">> WARNING: ETH.begin() FAILED. Running without network telemetry.");
@@ -654,6 +714,15 @@ void setup() {
 
 void loop() {
   checkForStateUpdate();
+  updateIdleFlicker();
+
+  // Inactive players' boards never leave idle lighting, regardless of the
+  // actual game state -- e.g. in a 2-player game, boards 5/6 (Player 3)
+  // just keep flickering green through Three/Two/One/Gameplay/Results.
+  // This only affects LED decisions below; readings/matching/telemetry are
+  // unaffected.
+  bool boardIdleOverride = !playerActive[myPlayer - 1];
+  int effectiveState = boardIdleOverride ? 1 : currentGameState;
 
   bool allCorrect = true;
   bool matched[3] = { false, false, false };
@@ -693,7 +762,7 @@ void loop() {
     bool isDeciding = (detectedIndex != stableIndex[i]);
 
     LEDState ledState;
-    if (currentGameState == 6 || currentGameState == 7) {
+    if (effectiveState == 6 || effectiveState == 7) {
       // Gameplay / Results: reflect actual connection data.
       ledState = LED_OFF;
       if (!isDeciding && isConnected) {
@@ -701,7 +770,7 @@ void loop() {
       }
     } else {
       // Idle / Three / Two / One / Start: lighting is state-driven, not reading-driven.
-      ledState = countdownOrIdleLEDState(i);
+      ledState = countdownOrIdleLEDState(i, effectiveState);
     }
     setLEDState(channels[i].redPin, channels[i].greenPin, ledState);
 
@@ -743,5 +812,11 @@ void loop() {
 
   sendGameStateOSC(stableIndex, matched, allCorrect);
 
-  delay(300);
+  // Throttle delay. checkForStateUpdate() (top of loop) only gets called once
+  // per pass, so this delay -- plus the ~45ms of ADC averaging above it -- is
+  // also the worst-case latency between TD sending /game_state or
+  // /player_active and this board's LEDs reflecting it. Kept short (rather
+  // than the original 300ms) specifically so that's small relative to the
+  // 1-second countdown states (Three/Two/One) on stage.
+  delay(50);
 }

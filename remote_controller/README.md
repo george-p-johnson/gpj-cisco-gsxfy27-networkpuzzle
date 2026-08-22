@@ -58,7 +58,8 @@ commands and report connection status back.
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for how this is made reachable from
 outside the LAN (Cloudflare Tunnel, `https://gsxnetworkpuzzle.com`) and how
-the show PC autostarts everything (`../start_show.bat` + Task Scheduler).
+the show PC autostarts everything, with crash auto-recovery
+(`../START_CISCO_NETWORK_PUZZLE.bat` + Task Scheduler).
 
 ## Message reference
 

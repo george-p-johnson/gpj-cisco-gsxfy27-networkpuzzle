@@ -13,10 +13,10 @@ The installation is **six physical Waveshare ESP32-S3-ETH boards, all running th
 * **Match Indicator LEDs:** Each channel has a dedicated bi-color LED:
   - **Green LED:** Illuminates when the patch cord connects a question socket to its **correct** answer socket (as defined by that board's configuration).
   - **Red LED:** Illuminates if the patch cord is connected to an **incorrect** answer socket. An **unplugged** (open circuit) socket shows **off**, not red -- see Section 8B.
-  - LED behavior above applies during **Gameplay**/**Results**; during **Idle**/**Three**/**Two**/**One**/**Start** the LEDs instead follow the countdown/lighting sequence driven by the controller (Section 7D, Section 8B), independent of what's actually plugged in.
+  - LED behavior above applies during **Gameplay**/**Results**; during **Idle**/**Three**/**Two**/**One**/**Start** the LEDs instead follow the countdown/lighting sequence driven by the controller (Section 7D, Section 8B/8C), independent of what's actually plugged in. During **Idle**, this means a randomized green flicker (Section 8C), mimicking an Ethernet switch port's activity LED, rather than solid off.
 * **Game Victory State:** A per-board success signal is triggered only when all three channels have correct matches simultaneously.
 * **Variable Configurations:** Correct answers are not hardcoded in the firmware. Each board reads its assigned questions and their correct answers from a shared `answer_table.tsv` on its SD card, selecting the right 3 rows based on a `device.cfg` file that names which of the six boards it is. This means the entire installation's questions can be re-authored by editing one spreadsheet-like file and copying it to six SD cards -- no reflashing, no hardware rewiring. See **Section 6**.
-* **Networked Telemetry (Two-Way):** Each board reports its live channel states to a central game controller (TouchDesigner) over Ethernet via OSC, and also receives the current game state back from the controller to drive its lighting. See **Section 7**.
+* **Networked Telemetry (Two-Way):** Each board reports its live channel states to a central game controller (TouchDesigner) over Ethernet via OSC, and also receives the current game state and per-player active flags back from the controller to drive its lighting -- a board whose player is inactive stays on idle lighting no matter what state the rest of the game is in. See **Section 7**.
 
 ---
 
@@ -76,7 +76,7 @@ The ESP32-S3 features a successive-approximation register (SAR) ADC. Utilizing t
 A patch cord passes through transient partial-contact states while being inserted or removed, which can momentarily read as a different resistor value than the one actually seated (or produce a fast, wide voltage sweep if the cord is being held/wiggled rather than fully seated -- this is expected behavior, not a fault).
 
 * **`DEBOUNCE_MS` (default `225`):** A classification must hold steady for this many milliseconds before it's promoted to `stableIndex[]` -- the value actually used for LED state and match-checking.
-* **Timer-based, not loop-count-based:** uses `millis()` so the debounce duration is exact regardless of the main loop's `300ms` throttle delay.
+* **Timer-based, not loop-count-based:** uses `millis()` so the debounce duration is exact regardless of the main loop's throttle delay (Section 8B/8C).
 * While a new classification is still within its debounce window (`detectedIndex != stableIndex`), the LED is deliberately held **off** rather than flashing red, so a cord being plugged in doesn't strobe red before settling green.
 
 ---
@@ -252,7 +252,7 @@ Each board reports its live channel states to a central game controller PC (runn
 * **Power:** boards use the Waveshare PoE add-on module (IEEE 802.3af). Requires either a PoE-capable switch/injector, or USB-C power per board if PoE hardware isn't in the path yet -- the two are independent of network config.
 
 ### B. OSC Message Format
-Sent once per `loop()` iteration (~every 300ms) once the Ethernet link is up. Fire-and-forget UDP -- if nothing is listening, packets are silently dropped with no effect on game logic.
+Sent once per `loop()` iteration (~every 95ms, see Section 8B's Throttle Delay step) once the Ethernet link is up. Fire-and-forget UDP -- if nothing is listening, packets are silently dropped with no effect on game logic.
 
 * **Address:** `/waveshare/<waveshare_index>` (e.g. `/waveshare/4`)
 * **Port:** `9000` (destination), sent to `controllerIP` (default `192.168.50.100`, overridable via `device.cfg`'s `controller_ip`)
@@ -276,12 +276,17 @@ The OSC packet encoder is hand-rolled (`sendOSCInts()` in `question_game.ino`) r
 * `ETH.begin()` happens in `setup()`, **after** the SD card block, because the static IP depends on `deviceIndex` having already been loaded.
 * `ethConnected` is tracked via the `Network.onEvent()` callback (`ARDUINO_EVENT_ETH_GOT_IP` / `..._LOST_IP` / `..._DISCONNECTED`) and gates whether `sendGameStateOSC()` actually sends -- avoids trying to send before the link is ready.
 
-### D. Controller → Board: Game-State Lighting
-Boards also **listen** for incoming UDP: TouchDesigner broadcasts the current game state to `192.168.50.255:9003`, and each board reacts by driving its LEDs per Section 8B. This reuses the same `udp` object as outgoing telemetry (`udp.begin(STATE_LISTEN_PORT)` in `setup()`, once Ethernet is up) -- `NetworkUDP` supports simultaneous send (`beginPacket`/`write`/`endPacket`) and receive (`parsePacket`/`read`) on one instance, no second socket needed.
+### D. Controller → Board: Game-State Lighting & Player-Active State
+Boards also **listen** for incoming UDP: TouchDesigner broadcasts the current game state (and which players are active) to `192.168.50.255:9003`, and each board reacts by driving its LEDs per Section 8B. This reuses the same `udp` object as outgoing telemetry (`udp.begin(STATE_LISTEN_PORT)` in `setup()`, once Ethernet is up) -- `NetworkUDP` supports simultaneous send (`beginPacket`/`write`/`endPacket`) and receive (`parsePacket`/`read`) on one instance, no second socket needed.
 
-* **Address:** `/game_state`
-* **Port:** `9003` (UDP), received via broadcast to `192.168.50.255` -- reaches all six boards from a single send, no need to target each board's individual static IP
-* **Args (1 int32):** the game state, using the same 1-7 convention the remote controller uses (see `../remote_controller/README.md`):
+Two addresses are handled on this port:
+
+| Address | Args | Purpose |
+| :--- | :--- | :--- |
+| `/game_state` | 1 int32 | The game state, using the same 1-7 convention the remote controller uses (see `../remote_controller/README.md`) |
+| `/player_active` | 3 int32 (p1, p2, p3 as 0/1) | Which of the 3 players are currently active -- see below |
+
+`/game_state` values:
 
 | Value | State |
 | :---: | --- |
@@ -293,9 +298,11 @@ Boards also **listen** for incoming UDP: TouchDesigner broadcasts the current ga
 | 6 | Gameplay |
 | 7 | Results |
 
-`currentGameState` defaults to `1` (Idle) at boot, before TD has sent anything, so a board that hasn't heard from the controller yet shows all LEDs off rather than an undefined state.
+`currentGameState` defaults to `1` (Idle) at boot, before TD has sent anything. `playerActive[3]` defaults to all-`true` at boot, so a board's lighting is unchanged unless/until TD actually sends `/player_active`.
 
-Parsing (`checkForStateUpdate()` in `question_game.ino`) is a minimal hand-rolled OSC reader, mirroring the hand-rolled encoder already used for outgoing telemetry -- same reasoning, avoids a third-party OSC library dependency.
+**Player-active override:** Each board knows which player it belongs to (`myPlayer`, computed at boot from `deviceIndex` -- boards 1/2 -> P1, 3/4 -> P2, 5/6 -> P3, same mapping as Section 6D). If that player is inactive (`playerActive[myPlayer-1] == false`), the board treats itself as Idle for LED purposes regardless of the actual `currentGameState` -- see `boardIdleOverride`/`effectiveState` in `loop()`. This lets a multiplayer variant leave un-used players' boards flickering idle throughout Three/Two/One/Gameplay/Results instead of running the countdown/match lighting for a player who isn't playing. Readings, matching, and OSC telemetry are unaffected -- only the LED decision is overridden.
+
+Parsing (`checkForStateUpdate()` in `question_game.ino`) is a minimal hand-rolled OSC reader, mirroring the hand-rolled encoder already used for outgoing telemetry -- same reasoning, avoids a third-party OSC library dependency. It now branches on the address and type-tag arg count to support both 1-arg and 3-arg messages on the same socket.
 
 ### E. Diagnostic Tool
 [`ETH_Test/ETH_Test.ino`](../ETH_Test/ETH_Test.ino) is a minimal standalone sketch (link up, static IP, no SD/game logic) for validating Ethernet connectivity in isolation -- use this first if network-related symptoms come up again, before assuming the integration code is at fault.
@@ -320,21 +327,31 @@ int correctAnswers[3] = {
 
 ### B. Logic Processing Flow
 On every iteration of the `loop()`:
-0. **Check for a game-state update:** `checkForStateUpdate()` (Section 7D) polls for an incoming `/game_state` broadcast and updates `currentGameState` if one arrived; otherwise it's a no-op and the previous value carries over.
-1. **Reset Victory Tracker:** A boolean flag `allCorrect` is initialized to `true`.
-2. **Channel Polling:** For each channel `i` from `0` to `2`:
+0. **Check for a game-state update:** `checkForStateUpdate()` (Section 7D) polls for an incoming `/game_state` or `/player_active` broadcast and updates `currentGameState`/`playerActive[]` if one arrived; otherwise it's a no-op and the previous values carry over. `updateIdleFlicker()` then advances each channel's randomized idle-flicker timer (Section 8C) unconditionally, so its timing stays continuous whether or not it's currently visible.
+1. **Compute effective state:** `boardIdleOverride = !playerActive[myPlayer-1]`; `effectiveState = boardIdleOverride ? 1 : currentGameState`. All LED decisions below use `effectiveState`, not `currentGameState` directly -- see Section 7D.
+2. **Reset Victory Tracker:** A boolean flag `allCorrect` is initialized to `true`.
+3. **Channel Polling:** For each channel `i` from `0` to `2`:
    - Measure the smoothed analog voltage ($V_{\text{out}}$) on `ANALOG_PINS[i]` after flushing the charge.
    - Map the voltage value to its resistor classification index `detectedIndex` using the Midpoint Decision boundaries.
    - Apply debounce (Section 3C) to promote `detectedIndex` to `stableIndex[i]`.
-   - Compare `stableIndex[i]` with the target `correctAnswers[i]` -- this comparison (`matched[i]`, `allCorrect`) always runs and is always sent in telemetry, regardless of `currentGameState`.
-   - Update LEDs, gated by `currentGameState`:
-     - **Idle / Start:** off, regardless of what's plugged in.
+   - Compare `stableIndex[i]` with the target `correctAnswers[i]` -- this comparison (`matched[i]`, `allCorrect`) always runs and is always sent in telemetry, regardless of `currentGameState`/`effectiveState`.
+   - Update LEDs, gated by `effectiveState`:
+     - **Idle:** flickering green (Section 8C), regardless of what's plugged in.
+     - **Start:** off, regardless of what's plugged in.
      - **Three / Two / One:** a countdown, independent of actual readings -- one more channel lights red per step (CH1 only → CH1+CH2 → all three).
      - **Gameplay / Results:** reflects the real reading -- green if matched, red if plugged but wrong, off if the socket is empty (unplugged) or the classification is still debouncing.
    - Output Serial telemetry details (measured mV, detected resistor name, match status).
-3. **Master Win Assertion:** If `allCorrect` remains `true` after polling all three channels, output the unified game win telemetry (`*** GAME SOLVED: ALL PATCHES CORRECT! ***`).
-4. **OSC Telemetry:** Send this board's current state to the game controller (Section 7B).
-5. **Throttle Delay:** A final $300\text{ms}$ delay throttles the scanning loop to conserve processing cycles and provide human-readable serial logs.
+4. **Master Win Assertion:** If `allCorrect` remains `true` after polling all three channels, output the unified game win telemetry (`*** GAME SOLVED: ALL PATCHES CORRECT! ***`).
+5. **OSC Telemetry:** Send this board's current state to the game controller (Section 7B).
+6. **Throttle Delay:** A final $50\text{ms}$ delay throttles the scanning loop. Originally $300\text{ms}$ (to conserve processing cycles and provide human-readable serial logs), but shortened -- since `checkForStateUpdate()` (step 0) only runs once per loop pass, this delay is also the dominant term in the worst-case latency between TD sending `/game_state`/`/player_active` and this board's LEDs reflecting it. At $50\text{ms}$ (plus ~$45\text{ms}$ of ADC averaging below it, for a ~$95\text{ms}$ total loop period), that latency stays small relative to the 1-second Three/Two/One countdown states on stage. Neither ESP32-S3 processing headroom nor Serial throughput (already non-blocking via `Serial.setTxTimeoutMs(0)`) are a concern at this rate.
+
+### C. Idle Lighting: "Ethernet Switch" Flicker
+While a channel is showing Idle lighting (either because `currentGameState` really is Idle, or because `boardIdleOverride` forces it there for an inactive player -- Section 7D), the LED flickers green instead of sitting solid or off, mimicking an Ethernet switch port's link/activity LED.
+
+* `updateIdleFlicker()` runs unconditionally at the top of every `loop()` iteration (not gated by state), so each channel's flicker timing free-runs continuously rather than restarting whenever a board re-enters Idle.
+* Each of the 3 channels has its own independent on/off timer (`flickerOn[3]`, `flickerNextToggleMs[3]`) -- they are not synchronized, so the three LEDs flicker at different, random moments, like independent switch ports rather than a single synchronized blink.
+* Each toggle rolls a new random duration: ON bursts are short (`40-150ms`), OFF gaps are longer (`150-600ms`) -- mostly-off punctuated by quick flashes, matching the look of intermittent traffic rather than a steady blink.
+* The main loop advances roughly every ~95ms (Section 8B step 6), so flicker updates happen at that cadence in practice -- still clearly irregular and non-synchronized across channels, and now close enough to the shortest ON burst (40ms) that the flicker reads as genuinely quick rather than just "irregular."
 
 ---
 

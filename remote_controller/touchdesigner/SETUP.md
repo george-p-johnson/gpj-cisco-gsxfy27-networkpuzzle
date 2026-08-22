@@ -71,6 +71,11 @@ def set_player_active(player_num, is_active):
     # TODO: wire to your actual player-activation logic
     debug(f'player {player_num} -> {"ON" if is_active else "OFF"}')
 
+    # Remember it so both the periodic timer (Section 3/5) and this
+    # immediate send can read it back -- see Section 5b.
+    op('player_active_holder').store('player_%d' % player_num, bool(is_active))
+    send_player_active_to_boards()
+
 
 def start_game():
     # TODO: pulse your Start Game logic
@@ -120,7 +125,7 @@ The remote controller understands 7 game-state integers:
 | 6 | Gameplay |
 | 7 | Results |
 
-1. Add an **OSC Out DAT** (`oscout1`).
+1. Add an **OSC Out DAT** (`oscout_remote`).
    - `Network Address`: `127.0.0.1`
    - `Network Port`: `9002`
 2. Add a **Timer CHOP** (or a **Timer COMP**) set to fire every ~1 second,
@@ -132,11 +137,11 @@ The remote controller understands 7 game-state integers:
 # CHOP Execute callback, watching a 1-second Timer CHOP
 
 def onValueChange(channel, sampleIndex, val, prev):
-    op('oscout1').sendOSC('/remote/heartbeat', [1])
+    op('oscout_remote').sendOSC('/remote/heartbeat', [1])
 
     # TODO: replace with wherever your game logic stores the current state (1-7)
     current_state = int(op('game_state_holder')['state'])
-    op('oscout1').sendOSC('/remote/game_state', [current_state])
+    op('oscout_remote').sendOSC('/remote/game_state', [current_state])
     return
 ```
 
@@ -164,43 +169,35 @@ tell "board alive, unchanged reading" apart from "board gone". **This
 requires reflashing all six boards** with the updated firmware (see
 `question_game/CLAUDE.md` Section 9C) before the steps below will work.
 
-Board comms (`oscin_comms`) is an **OSC In CHOP**, not a DAT, so this uses a
-`CHOP Execute DAT` rather than `onReceiveOSC`:
+Board comms (`oscin_comms`) is an **OSC In CHOP**, so the `heartbeat` arg
+lands on its own channel per board (naming depends on your CHOP's
+address/split settings -- confirm the actual name with a board sending live
+data, e.g. something like `waveshare1_7`; adjust the code below to match).
 
-1. First, confirm the actual channel name the `heartbeat` arg lands on --
-   open `oscin_comms`'s channel list with a board sending live data and look
-   for the last channel per address (naming depends on your CHOP's
-   address/split settings, e.g. something like `waveshare1/7` or
-   `waveshare1_7`). Adjust the regex below to match what you actually see.
+Rather than timestamping every incoming packet, liveness is decided by
+comparing that channel's *current* value against whatever it held on the
+*previous* 1-second tick -- since `heartbeat` increments on every send, an
+unchanged value between two ticks means the board has gone quiet. This reads
+directly on the same timer that already sends `/remote/heartbeat` and
+`/remote/game_state` (Section 3); no separate `CHOP Execute DAT` watching
+`oscin_comms` is needed:
 
-2. Add a `CHOP Execute DAT` watching `oscin_comms`, using `onValueChange`
-   (fires on *every* message here, since `heartbeat` always changes):
+```python
+# Same onCycle callback as Section 3, appended
+oscin_boards = op('oscin_comms')
+for board in range(1, 7):
+    chan_name = 'waveshare%d_7' % board  # <- adjust to your real channel naming
+    heartbeat = int(oscin_boards[chan_name].eval()) if chan_name in oscin_boards.chans() else None
+    prev_heartbeat = oscin_boards.fetch('prev_heartbeat_%d' % board, None)
+    live = heartbeat is not None and heartbeat != prev_heartbeat
+    oscin_boards.store('prev_heartbeat_%d' % board, heartbeat)
+    op('oscout_remote').sendOSC('/remote/waveshare/%d' % board, [1 if live else 0])
+```
 
-   ```python
-   # CHOP Execute DAT watching oscin_comms
-   import re
-
-   def onValueChange(channel, sampleIndex, val, prev):
-       m = re.match(r'waveshare(\d)_7$', channel.name)  # <- adjust to your real channel naming
-       if m:
-           board = int(m.group(1))
-           op('oscin_comms').store('last_seen_%d' % board, absTime.seconds)
-       return
-   ```
-
-3. On the same 1-second timer that already sends `/remote/heartbeat` and
-   `/remote/game_state` (Section 3), also send one message per board:
-
-   ```python
-   # Same onCycle callback as Section 3, appended
-   LIVE_WINDOW = 1.0  # seconds; boards report ~every 0.3s while connected
-
-   oscin_boards = op('oscin_comms')
-   for board in range(1, 7):
-       last_seen = oscin_boards.fetch('last_seen_%d' % board, None)
-       live = last_seen is not None and (absTime.seconds - last_seen) < LIVE_WINDOW
-       op('oscout_remote').sendOSC('/remote/waveshare/%d' % board, [1 if live else 0])
-   ```
+A board that's actually gone leaves `oscin_comms` holding its last-received
+value forever, so `live` correctly flips to `False` on the very next tick
+after it stops sending -- same ~1-second detection window as a timestamp
+approach, without needing wall-clock time or a second watcher DAT.
 
 Board index → panel, if you want it to match the physical layout: boards
 1-2 are Panel 1 (Player 1), 3-4 are Panel 2 (Player 2), 5-6 are Panel 3
@@ -225,12 +222,16 @@ the current state number:
 
 | State | Board lighting behavior |
 | --- | --- |
-| Idle (1) | All LEDs off, regardless of what's plugged in |
+| Idle (1) | Flickering green (mimics an Ethernet switch port's activity LED), regardless of what's plugged in |
 | Three (2) | CH1 red, CH2/CH3 off |
 | Two (3) | CH1 + CH2 red, CH3 off |
 | One (4) | CH1 + CH2 + CH3 red |
 | Start (5) | All off |
 | Gameplay (6) / Results (7) | Real connection data: green = correct, red = wrong resistor plugged in, off = socket empty |
+
+A board whose player is inactive (see Section 5b below) shows Idle lighting
+throughout, regardless of which of the states above the rest of the game is
+actually in.
 
 1. Add an **OSC Out DAT** (`oscout_boards`):
    - `Network Address`: `192.168.50.255` (subnet broadcast -- reaches all
@@ -261,6 +262,67 @@ the current state number:
    at each step (Gameplay needs an actual patch cord plugged in to see
    green/red -- otherwise all three sockets read NONE and stay off, which
    is also correct).
+
+## 5b. Send player-active state to the boards
+
+Board firmware also listens on the same UDP **9003** port for a
+`/player_active` broadcast (**3 int32 args**, `[p1, p2, p3]` as 0/1) --
+**this requires the same reflash** as Section 5 (see `question_game/CLAUDE.md`
+Section 7D). Each board knows which player it belongs to (boards 1/2 = P1,
+3/4 = P2, 5/6 = P3, same mapping as Section 4's Board index → panel note
+above) and, when that player is inactive, shows Idle lighting no matter what
+`/game_state` says -- so a 2-player game leaves the unused player's two
+boards flickering idle throughout the whole match instead of running the
+countdown/match lighting for nobody.
+
+1. Reuse the same `oscout_boards` DAT from Section 5 -- no new OSC Out DAT
+   needed, just a new address on the same port.
+2. Give TD somewhere to remember the 3 players' active state so it can be
+   read back by both an immediate send and the periodic timer. A `Base COMP`
+   with `.store()`/`.fetch()` works well (called `player_active_holder`
+   below); a Table DAT works too if you prefer.
+3. In `set_player_active()` (Section 2's Callbacks DAT), store the value and
+   immediately re-broadcast to the boards -- already shown inline in
+   Section 2 above:
+
+   ```python
+   def set_player_active(player_num, is_active):
+       # TODO: wire to your actual player-activation logic
+       op('player_active_holder').store('player_%d' % player_num, bool(is_active))
+       send_player_active_to_boards()
+
+
+   def send_player_active_to_boards():
+       holder = op('player_active_holder')
+       p1 = 1 if holder.fetch('player_1', True) else 0
+       p2 = 1 if holder.fetch('player_2', True) else 0
+       p3 = 1 if holder.fetch('player_3', True) else 0
+       op('oscout_boards').sendOSC('/player_active', [p1, p2, p3])
+   ```
+
+   Default each `fetch()` to `True` (matches the firmware's own default of
+   all-active) so a board never gets a spurious idle-lock before TD has
+   heard anything.
+
+4. Also call `send_player_active_to_boards()` from the same 1-second timer
+   that already sends `/game_state` (Section 3/5), so a board that reboots
+   mid-game (or missed a packet) still converges on the correct state within
+   a second, rather than waiting for the next actual toggle. That function
+   lives in `oscin1`'s Callbacks DAT (a different DAT/Python module than this
+   Timer's CHOP Execute DAT), so reach across with `.module`:
+
+   ```python
+   # Same onCycle callback as Section 3/5, appended
+   op('oscin1').module.send_player_active_to_boards()
+   ```
+
+5. Sanity check on the bench: with a board flashed and player-active wiring
+   done, toggle a player OFF on the remote page while that board's state is
+   Idle, then step the TD state through Three → Two → One → Gameplay -- the
+   board should stay on flickering-green idle lighting the whole time
+   instead of following the countdown/match lighting. Toggle the player back
+   ON and confirm the board immediately starts following `/game_state`
+   again on the next send.
 
 ## 6. Firewall
 
