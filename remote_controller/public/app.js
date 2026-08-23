@@ -1,12 +1,11 @@
 (() => {
   const statusEl = document.getElementById('status');
   const statusText = document.getElementById('statusText');
-  const menuToggle = document.getElementById('menuToggle');
-  const menu = document.getElementById('menu');
   const gameStateEl = document.getElementById('gameState');
   const gameStateValue = document.getElementById('gameStateValue');
   const startBtn = document.querySelector('.pulse-btn.start');
   const boardStatusEl = document.getElementById('boardStatus');
+  const connectionWarningEl = document.getElementById('connectionWarning');
 
   const IDLE_STATE = 1;
 
@@ -23,12 +22,6 @@
       dot,
     ])
   );
-
-  menuToggle.addEventListener('click', () => {
-    const expanded = menuToggle.getAttribute('aria-expanded') === 'true';
-    menuToggle.setAttribute('aria-expanded', String(!expanded));
-    menu.hidden = expanded;
-  });
 
   let ws;
   let reconnectDelay = 1000;
@@ -74,9 +67,13 @@
     }
   }
 
-  function updateStartButton(gameState, players) {
+  function updateStartButton(gameState, players, anyConnected) {
     const anyPlayerActive = Object.values(players || {}).some(Boolean);
-    startBtn.disabled = gameState !== IDLE_STATE || !anyPlayerActive;
+    startBtn.disabled = gameState !== IDLE_STATE || !anyPlayerActive || Boolean(anyConnected);
+  }
+
+  function updateConnectionWarning(gameState, anyConnected) {
+    connectionWarningEl.hidden = !(gameState === IDLE_STATE && anyConnected);
   }
 
   function connect() {
@@ -98,7 +95,8 @@
         setStatus(msg.connected);
         applyPlayers(msg.players);
         applyGameState(msg.gameState, msg.gameStateLabel);
-        updateStartButton(msg.gameState, msg.players);
+        updateStartButton(msg.gameState, msg.players, msg.anyConnected);
+        updateConnectionWarning(msg.gameState, msg.anyConnected);
         applyWaveshare(msg.waveshare);
       }
     });

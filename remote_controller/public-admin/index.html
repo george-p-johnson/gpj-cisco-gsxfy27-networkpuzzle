@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Network Puzzle - Board Status</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Board Status</h1>
+    <div class="status" id="status">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Connecting&hellip;</span>
+    </div>
+  </header>
+
+  <section class="admin-actions">
+    <button class="pulse-btn" data-action="open_monitors">Open Monitors</button>
+    <button class="pulse-btn" data-action="reset_best_time">Reset Best Time</button>
+  </section>
+
+  <main id="panels"></main>
+
+  <script src="app.js"></script>
+</body>
+</html>

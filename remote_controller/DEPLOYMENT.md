@@ -113,6 +113,61 @@ resolved it.
    should return `200`, not `530` (dead tunnel) or `502` (tunnel up,
    origin unreachable).
 
+## Admin status subdomain (`admin.gsxnetworkpuzzle.com`)
+
+The remote controller's private per-socket status page (`public-admin/` --
+see `touchdesigner/SETUP.md` Section 4b) is gated by hostname: it's only
+served to requests whose `Host` header is exactly `ADMIN_HOSTNAME` (`.env`,
+default `admin.gsxnetworkpuzzle.com`). Any other hostname -- including the
+main public one -- gets the normal control page and never sees the admin
+directory, so there's no path to guess. This is obscurity, not
+authentication: anyone who learns the admin hostname can load it with no
+login. Don't post/share it anywhere public.
+
+Both hostnames route through the same tunnel to the same origin
+(`http://127.0.0.1:8080` -- the Node server itself decides which page to
+serve based on the `Host` header it receives), so adding the subdomain is
+just another `ingress` rule + DNS route on the tunnel that already exists:
+
+1. Add a second hostname rule to
+   `C:\ProgramData\Cloudflare\cloudflared\config.yml`, **above** the
+   catch-all `http_status:404` rule (ingress rules are matched top to
+   bottom, first match wins):
+
+   ```yaml
+   tunnel: 39103a87-015e-4755-9714-8158f1eb55c2
+   credentials-file: C:\ProgramData\Cloudflare\cloudflared\39103a87-015e-4755-9714-8158f1eb55c2.json
+
+   ingress:
+     - hostname: gsxnetworkpuzzle.com
+       service: http://127.0.0.1:8080
+     - hostname: admin.gsxnetworkpuzzle.com
+       service: http://127.0.0.1:8080
+     - service: http_status:404
+   ```
+
+2. Route DNS for the new hostname to the same tunnel:
+
+   ```powershell
+   cloudflared tunnel route dns gsx-remote-controller admin.gsxnetworkpuzzle.com
+   ```
+
+3. Restart the service so it picks up the new config:
+
+   ```powershell
+   Get-Process cloudflared | Stop-Process -Force
+   Start-Sleep -Seconds 2
+   Start-Service -Name Cloudflared
+   ```
+
+4. Verify: `https://admin.gsxnetworkpuzzle.com` should show the board status
+   page; `https://gsxnetworkpuzzle.com` should still show the normal control
+   page and must **not** show admin content at any path.
+
+Local testing without touching the tunnel: `curl -H "Host: admin.gsxnetworkpuzzle.com" http://localhost:8080/`
+serves the admin page directly from the Node server, no DNS/tunnel changes
+needed.
+
 ## Autostart: `START_CISCO_NETWORK_PUZZLE.bat`
 
 [`../START_CISCO_NETWORK_PUZZLE.bat`](../START_CISCO_NETWORK_PUZZLE.bat)
@@ -154,3 +209,29 @@ user is logged on"** in the task's General tab, for the same reason.
 server bound port 8080, TD launched with the project loaded, and TD's
 heartbeat reached the server (remote page showed Connected/Idle) -- all
 without any manual intervention.
+
+### If the site is down and isn't coming back on its own
+
+The auto-recovery above only works while the watchdog console window itself
+is still running -- if *that* window got closed (crashed, closed by
+accident, closed in the wrong order during a manual restart), the inner
+`node server.js` process it was supervising has no way to come back on its
+own, no matter how long you wait.
+
+Check for both **before** assuming the server crashed for some deeper reason:
+- Is a `node.exe` process bound to port 8080? (`netstat -ano | findstr ":8080"`)
+- Is the **"GSX Remote Controller (auto-restart)"** console window still open?
+
+If the node process is gone and so is its watchdog window, don't just run
+`node server.js` directly -- that gets the site back up but leaves it
+unsupervised again (a second crash won't self-heal). Instead relaunch the
+watchdog script itself so recovery is restored:
+
+```powershell
+Start-Process -FilePath "run_server_watchdog.bat" -WorkingDirectory "C:\_projects\gpj-cisco-gsxfy27-networkpuzzle"
+```
+
+This has happened more than once with no clear root cause identified yet --
+if it recurs, worth checking Windows Event Viewer for why the watchdog's
+`cmd.exe` itself exited (a plain `:loop ... goto loop` batch script normally
+never does, so something external likely killed it).

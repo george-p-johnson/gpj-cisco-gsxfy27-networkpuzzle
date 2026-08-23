@@ -1,5 +1,7 @@
 # Arduino Resistor Match Question/Answer Game: System Reference & Guide
 
+> **This file describes the original single-board prototype and is out of date.** The live installation runs six boards driven by a shared `answer_table.tsv` answer key (not the hardcoded `correctAnswers[3]` array below), plus a networked remote controller and admin status page. See [`question_game/CLAUDE.md`](question_game/CLAUDE.md) for the current system, and [`remote_controller/README.md`](remote_controller/README.md) for the remote controller / admin page. The electrical design, ADC signal processing, and calibration math below (Sections 2-4) are still accurate and unchanged.
+
 This file provides the comprehensive architectural, electrical, mathematical, and programmatic specification for the 3-Channel Resistor Match Question/Answer Game powered by the **Waveshare ESP32-S3** microcontroller. It is fully self-contained and serves as the single source of truth for understanding, modifying, or reproducing this system.
 
 ---

@@ -211,6 +211,39 @@ old channels), which gets you `onReceiveOSC(address, args)` with `args[7]`
 as the heartbeat directly, no channel-name guessing required. More
 disruptive to your existing network, but more robust long-term.
 
+## 4b. Forward per-channel readings (private admin status page)
+
+The remote controller has a private status page (`public-admin/`, gated by
+`ADMIN_HOSTNAME` -- see `DEPLOYMENT.md`), grouped by Player 1/2/3, that shows
+each board's live resistor classification per question, e.g. "is Q4 on
+Player 2's boards plugged into 33kΩ." It reads 3 raw index values per board
+(0-10, see the resistor scale
+in `README.md`) -- just the classification, no match/correctness data.
+Pulled straight from the debounced index custom parameters the project
+already stores per question (`op.PROJECT.par.Indexp<board>q<channel>`), and
+sent on the same 1-second timer:
+
+```python
+# Same onCycle callback as Section 3/4, appended
+p1q1_idx = int(op.PROJECT.par.Indexp1q1)
+p1q2_idx = int(op.PROJECT.par.Indexp1q2)
+p1q3_idx = int(op.PROJECT.par.Indexp1q3)
+op('oscout_remote').sendOSC('/remote/waveshare_detail/1', [p1q1_idx, p1q2_idx, p1q3_idx])
+
+p2q1_idx = int(op.PROJECT.par.Indexp2q1)
+p2q2_idx = int(op.PROJECT.par.Indexp2q2)
+p2q3_idx = int(op.PROJECT.par.Indexp2q3)
+op('oscout_remote').sendOSC('/remote/waveshare_detail/2', [p2q1_idx, p2q2_idx, p2q3_idx])
+
+# ...same pattern for boards 3-6
+```
+
+The 3 values must be in channel order: `ch1Index, ch2Index, ch3Index`. This
+is a simpler substitute for the `oscin_comms`-channel-scraping approach an
+earlier version of this doc suggested -- if the project already has these
+debounced index pars available directly, reading them is more robust than
+guessing OSC In CHOP channel names.
+
 ## 5. Send game state to the boards (lighting effects)
 
 Board firmware now listens on UDP **9003** for a `/game_state` broadcast
@@ -323,6 +356,58 @@ countdown/match lighting for nobody.
    instead of following the countdown/match lighting. Toggle the player back
    ON and confirm the board immediately starts following `/game_state`
    again on the next send.
+
+## 5c. Report player-active state back to the remote controller
+
+The remote page's ON/OFF display was previously just the *server's own
+memory* of the last `/remote/player/<n>` command it sent -- TD never
+actually confirmed what the real state was. This is wrong the moment the
+two disagree: **the Node server's player state resets to all-OFF on every
+restart**, regardless of what TD still has active, so a restart mid-show
+would show every player OFF on the page even with a live game running.
+
+Fix: TD reports the same `player_active_holder` values it already computes
+for Section 5b back to the remote controller too -- same values, one more
+destination. `state.players` on receipt becomes authoritative (overwrites
+whatever the server locally assumed), so a fresh server always converges to
+the truth within about a second of TD's next send.
+
+1. No new OSC Out DAT needed -- reuse `oscout_remote` (already sending
+   `/remote/heartbeat` and `/remote/game_state`, port 9002).
+2. Add a second send function alongside `send_player_active_to_boards()`
+   (Section 5b, `oscin1`'s Callbacks DAT):
+
+   ```python
+   def send_player_active_to_remote():
+       holder = op('player_active_holder')
+       p1 = 1 if holder.fetch('player_1', True) else 0
+       p2 = 1 if holder.fetch('player_2', True) else 0
+       p3 = 1 if holder.fetch('player_3', True) else 0
+       op('oscout_remote').sendOSC('/remote/player_active', [p1, p2, p3])
+   ```
+
+3. Call it everywhere `send_player_active_to_boards()` is already called --
+   both the immediate send in `set_player_active()` and the periodic one in
+   the Timer's CHOP Execute DAT:
+
+   ```python
+   def set_player_active(player_num, is_active):
+       # TODO: wire to your actual player-activation logic
+       op('player_active_holder').store('player_%d' % player_num, bool(is_active))
+       send_player_active_to_boards()
+       send_player_active_to_remote()
+   ```
+
+   ```python
+   # Same onCycle callback as Section 3/5/5b, appended
+   op('oscin1').module.send_player_active_to_remote()
+   ```
+
+4. Sanity check: restart the Node server (close the "GSX Remote Controller"
+   console window, let the watchdog relaunch it -- see `DEPLOYMENT.md`)
+   while a player is toggled ON in TD. The remote page should show that
+   player ON again within about a second of the fresh server coming up,
+   without needing anyone to touch the page.
 
 ## 6. Firewall
 
