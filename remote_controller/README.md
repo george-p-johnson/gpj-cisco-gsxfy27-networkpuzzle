@@ -8,6 +8,7 @@ tablet, or laptop on the same network as the show PC.
 - A live **Connected / Disconnected** indicator for the link to TouchDesigner
 - A live **game state** display (Idle / Three / Two / One / Start / Gameplay / Results)
 - A live **Boards** indicator showing which of the 6 ESP32 question boards are currently reporting, grouped by panel
+- A **Show Answer Key** toggle, collapsed by default, revealing each player's Q1-Q6 answer socket and resistor value (e.g. "Q3 -> Socket A7, 47kΩ") for a docent to reference on the floor. Read once from `answer_table.tsv` at server launch (same restart-to-reload caveat as the admin page's answer data, see below) and sent to every client on the public page -- deliberately not admin-gated, since the docent is this page's primary user, even though the page is also reachable off the LAN per `DEPLOYMENT.md`.
 
 It runs as a small Node.js server on the same Windows PC as TouchDesigner:
 the server hosts the control page over plain HTTP/WebSocket for any device

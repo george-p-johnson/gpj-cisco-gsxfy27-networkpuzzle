@@ -7,6 +7,8 @@
   const boardStatusEl = document.getElementById('boardStatus');
   const connectionWarningEl = document.getElementById('connectionWarning');
   const connectionWarningDetailEl = document.getElementById('connectionWarningDetail');
+  const answerKeyToggleEl = document.getElementById('answerKeyToggle');
+  const answerKeyEl = document.getElementById('answerKey');
 
   const IDLE_STATE = 1;
   const GAMEPLAY_STATE = 6;
@@ -118,6 +120,42 @@
     }
   }
 
+  // Static for the server's lifetime (read once from answer_table.tsv at
+  // launch) -- render it once on first receipt rather than rebuilding the
+  // DOM on every state broadcast.
+  let answerKeyRendered = false;
+
+  function renderAnswerKey(answerKey) {
+    answerKeyEl.innerHTML = '';
+    for (let player = 1; player <= 3; player++) {
+      const rows = answerKey[player] || [];
+      if (!rows.length) continue;
+
+      const group = document.createElement('div');
+      group.className = 'answer-key-group';
+
+      const heading = document.createElement('h3');
+      heading.textContent = `Player ${player}`;
+      group.appendChild(heading);
+
+      for (const row of rows) {
+        const item = document.createElement('div');
+        item.className = 'answer-key-row';
+        item.innerHTML = `<span class="answer-key-q">Q${row.question}</span><span class="answer-key-a">Socket A${row.answerSocket}</span><span class="answer-key-ohms">${row.resistor}</span>`;
+        group.appendChild(item);
+      }
+
+      answerKeyEl.appendChild(group);
+    }
+  }
+
+  answerKeyToggleEl.addEventListener('click', () => {
+    const showing = answerKeyEl.hidden;
+    answerKeyEl.hidden = !showing;
+    answerKeyToggleEl.setAttribute('aria-expanded', String(showing));
+    answerKeyToggleEl.textContent = showing ? 'Hide Answer Key' : 'Show Answer Key';
+  });
+
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -141,6 +179,10 @@
         updateStartButton(msg.gameState, msg.players, msg.anyConnected);
         updateConnectionWarning(msg.gameState, msg.anyConnected, msg.connectedCables);
         applyWaveshare(msg.waveshare);
+        if (!answerKeyRendered && msg.answerKey) {
+          renderAnswerKey(msg.answerKey);
+          answerKeyRendered = true;
+        }
       }
     });
 

@@ -110,33 +110,58 @@ function computeBoardsReady() {
 
 const ANSWER_TABLE_PATH = path.join(__dirname, '..', 'answer_table.tsv');
 
-// Per-board (1-6) array of the 3 correct resistor indices for that board's
-// CH1/CH2/CH3, loaded once at launch from answer_table.tsv (repo root -- the
-// same file the ESP32 boards' SD cards read from). Board->question mapping
-// matches question_game/CLAUDE.md Section 6D: board 1 = panel 1 questions
-// 1-3, board 2 = panel 1 questions 4-6, board 3 = panel 2 questions 1-3, etc.
-function loadAnswerIndex() {
-  const result = {};
+// Same 0-9 resistor scale question_game.ino classifies against and
+// public-admin/app.js's RESISTOR_LABELS mirrors -- kept here too so the
+// docent answer key (below) can render a human label without re-deriving it
+// from the raw ohms column.
+const RESISTOR_LABELS = [
+  '470Ω', '1kΩ', '2.2kΩ', '4.7kΩ', '10kΩ',
+  '22kΩ', '33kΩ', '47kΩ', '68kΩ', '100kΩ',
+];
+
+// Parses answer_table.tsv once into flat rows -- both loadAnswerIndex()
+// (board-keyed, for the admin live-comparison page) and loadDocentAnswerKey()
+// (player-keyed, for the public answer-key toggle) derive their shape from
+// this same parse rather than each re-reading the file.
+function parseAnswerTableRows() {
   let raw;
   try {
     raw = fs.readFileSync(ANSWER_TABLE_PATH, 'utf8');
   } catch (err) {
     console.error(`Could not read answer_table.tsv at ${ANSWER_TABLE_PATH}: ${err.message}`);
-    console.error('Admin status page will show readings without a correct-answer comparison.');
-    return result;
+    console.error('Admin status page and answer key will be unavailable.');
+    return [];
   }
 
-  const byPanelQuestion = {};
-  const rows = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const row of rows.slice(1)) { // skip header row
-    const cols = row.split('\t');
+  const rows = [];
+  for (const line of raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(1)) { // skip header
+    const cols = line.split('\t');
     const questionMatch = /^P(\d+)q(\d+)$/.exec(cols[0] || '');
+    const answerMatch = /^P(\d+)a(\d+)$/.exec(cols[1] || '');
     const index = Number(cols[3]);
     if (!questionMatch || Number.isNaN(index)) continue;
-    const panel = Number(questionMatch[1]);
-    const question = Number(questionMatch[2]);
-    byPanelQuestion[panel] = byPanelQuestion[panel] || {};
-    byPanelQuestion[panel][question] = index;
+    rows.push({
+      player: Number(questionMatch[1]),
+      question: Number(questionMatch[2]),
+      answerSocket: answerMatch ? Number(answerMatch[2]) : null,
+      index,
+    });
+  }
+  return rows;
+}
+
+const answerTableRows = parseAnswerTableRows();
+
+// Per-board (1-6) array of the 3 correct resistor indices for that board's
+// CH1/CH2/CH3 -- board->question mapping matches question_game/CLAUDE.md
+// Section 6D: board 1 = panel 1 questions 1-3, board 2 = panel 1 questions
+// 4-6, board 3 = panel 2 questions 1-3, etc.
+function loadAnswerIndex() {
+  const result = {};
+  const byPanelQuestion = {};
+  for (const row of answerTableRows) {
+    byPanelQuestion[row.player] = byPanelQuestion[row.player] || {};
+    byPanelQuestion[row.player][row.question] = row.index;
   }
 
   for (let board = 1; board <= 6; board++) {
@@ -154,6 +179,31 @@ function loadAnswerIndex() {
 }
 
 const answerIndex = loadAnswerIndex();
+
+// Player-keyed, human-friendly rendering of the same answer table -- names
+// the answer-socket number and resistor value per question instead of the
+// board's raw comparison index. Powers the public page's "Show Answer Key"
+// toggle (see README -- deliberately public/docent-facing, not admin-gated,
+// per an explicit call on this: the public control page is already the
+// docent's page, even though it's also reachable off the LAN per
+// DEPLOYMENT.md).
+function loadDocentAnswerKey() {
+  const result = { 1: [], 2: [], 3: [] };
+  for (const row of answerTableRows) {
+    if (!result[row.player]) continue;
+    result[row.player].push({
+      question: row.question,
+      answerSocket: row.answerSocket,
+      resistor: RESISTOR_LABELS[row.index] ?? `? (${row.index})`,
+    });
+  }
+  for (const player of Object.keys(result)) {
+    result[player].sort((a, b) => a.question - b.question);
+  }
+  return result;
+}
+
+const docentAnswerKey = loadDocentAnswerKey();
 
 function isAdminHost(hostHeader) {
   const host = (hostHeader || '').split(':')[0].toLowerCase();
@@ -335,6 +385,7 @@ function currentStateMessage() {
     anyConnected: state.anyConnected,
     connectedCables: state.connectedCables,
     playerResults: state.playerResults,
+    answerKey: docentAnswerKey,
   });
 }
 
