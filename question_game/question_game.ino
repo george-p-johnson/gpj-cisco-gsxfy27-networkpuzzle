@@ -100,6 +100,26 @@ int myPlayer = 1;
 // board's behavior is unchanged until/unless TD actually sends this.
 bool playerActive[3] = { true, true, true };
 
+// Per-player round result, broadcast by TD alongside /game_state once a
+// round resolves -- see checkForStateUpdate() and applyResultEffect() below.
+// 0=Try Again, 1=Winner, 2=2nd place, 3=3rd place. -1 means no result has
+// been received yet for that player (distinct from a real 0-3 value), so a
+// board doesn't fire an effect off its own startup default.
+int playerResult[3] = { -1, -1, -1 };
+
+// --- RESULT LIGHTING EFFECTS ---
+// Triggered when this board's own player's result value changes while in
+// Gameplay/Results; held regardless of what's plugged in until the game
+// state returns to Idle. See applyResultEffect()/startResultEffect() and the
+// effectiveState handling in loop().
+enum ResultEffect { EFFECT_NONE, EFFECT_WIN_CHASE, EFFECT_SECOND_CHASE, EFFECT_THIRD_CHASE, EFFECT_TRY_AGAIN_FLASH };
+ResultEffect activeEffect = EFFECT_NONE;
+int lastEffectResult = -1;         // playerResult value the active effect (if any) was started for
+unsigned long effectNextStepMs = 0;
+int effectStep = 0;
+const unsigned long CHASE_STEP_MS = 90;         // vegas-chase advance rate
+const unsigned long TRY_AGAIN_FLASH_MS = 300;   // error-flash on/off period
+
 struct SocketChannel {
   int analogPin;
   int redPin;
@@ -168,17 +188,27 @@ unsigned long candidateSinceMs[3] = { 0, 0, 0 }; // when candidateIndex[i] first
 // solid, mimicking an Ethernet switch port's link/activity LED. Non-blocking
 // and per-channel independent: each channel rolls its own random on/off
 // duration once its current one elapses, so the three don't flicker in sync.
+// Mostly-on (long ON bursts, short OFF gaps) so the resting look reads as a
+// live link light, not a mostly-dark one. A fraction of ON bursts render
+// yellow instead of green to mimic a switch port's occasional amber/collision
+// activity blip.
 bool flickerOn[3] = { false, false, false };
+bool flickerYellow[3] = { false, false, false };
 unsigned long flickerNextToggleMs[3] = { 0, 0, 0 };
+const int FLICKER_YELLOW_CHANCE_PCT = 20; // odds a given ON burst is yellow instead of green
 
 void updateIdleFlicker() {
   unsigned long now = millis();
   for (int i = 0; i < 3; i++) {
     if (now >= flickerNextToggleMs[i]) {
       flickerOn[i] = !flickerOn[i];
-      // Short green flashes against longer off gaps reads like intermittent
-      // traffic rather than a steady blink.
-      unsigned long duration = flickerOn[i] ? random(40, 150) : random(150, 600);
+      unsigned long duration;
+      if (flickerOn[i]) {
+        duration = random(300, 700);
+        flickerYellow[i] = random(0, 100) < FLICKER_YELLOW_CHANCE_PCT;
+      } else {
+        duration = random(60, 180);
+      }
       flickerNextToggleMs[i] = now + duration;
     }
   }
@@ -390,6 +420,56 @@ void setLEDState(int redPin, int greenPin, LEDState state) {
   analogWrite(greenPin, greenLevel);
 }
 
+// Starts (or restarts) a result effect for the given playerResult value
+// (0=Try Again, 1=Winner, 2=2nd, 3=3rd -- see playerResult[] declaration).
+// Resets the animation phase so every new result starts from a clean beat.
+void startResultEffect(int resultValue) {
+  switch (resultValue) {
+    case 1:  activeEffect = EFFECT_WIN_CHASE; break;
+    case 2:  activeEffect = EFFECT_SECOND_CHASE; break;
+    case 3:  activeEffect = EFFECT_THIRD_CHASE; break;
+    default: activeEffect = EFFECT_TRY_AGAIN_FLASH; break; // 0, or any unexpected value
+  }
+  effectStep = 0;
+  effectNextStepMs = millis();
+}
+
+// Drives all 3 channel LEDs for the currently active result effect, in place
+// of the normal reading-driven Gameplay/Results lighting. Call once per loop
+// pass (not per channel) while activeEffect != EFFECT_NONE.
+//  - Winner/2nd/3rd: a 3-step vegas-style chase around the channels in the
+//    result's color, capped every 4th beat with all three flashing together
+//    (the "jackpot" beat).
+//  - Try Again: all three channels flash red on/off together, like a
+//    blinking error indicator.
+void applyResultEffect() {
+  if (activeEffect == EFFECT_NONE) return;
+
+  unsigned long now = millis();
+
+  if (activeEffect == EFFECT_TRY_AGAIN_FLASH) {
+    unsigned long phase = (now / TRY_AGAIN_FLASH_MS) % 2;
+    LEDState state = (phase == 0) ? LED_RED : LED_OFF;
+    for (int i = 0; i < 3; i++) {
+      setLEDState(channels[i].redPin, channels[i].greenPin, state);
+    }
+    return;
+  }
+
+  LEDState color = LED_GREEN;
+  if (activeEffect == EFFECT_SECOND_CHASE) color = LED_YELLOW;
+  else if (activeEffect == EFFECT_THIRD_CHASE) color = LED_RED;
+
+  if (now >= effectNextStepMs) {
+    effectStep = (effectStep + 1) % 4; // 0,1,2 = chase position; 3 = all-lit flash beat
+    effectNextStepMs = now + CHASE_STEP_MS;
+  }
+  for (int i = 0; i < 3; i++) {
+    bool lit = (effectStep == 3) || (i == effectStep);
+    setLEDState(channels[i].redPin, channels[i].greenPin, lit ? color : LED_OFF);
+  }
+}
+
 void printActiveThresholds() {
   Serial.println("\n========================================================================");
   Serial.print("ACTIVE CLASSIFICATION THRESHOLDS (THRESHOLD_BIAS: ");
@@ -499,47 +579,69 @@ void sendGameStateOSC(const int stableIdx[3], const bool matched[3], bool allCor
   sendOSCInts(address.c_str(), values, 8);
 }
 
-// Checks for an incoming OSC message on the shared state-listen port and
-// updates game state accordingly. Two addresses are handled, both broadcast
+// Checks for incoming OSC messages on the shared state-listen port and
+// updates game state accordingly. Three addresses are handled, all broadcast
 // by TD to 192.168.50.255:9003:
 //  - "/game_state"    (1 int32 arg)  -- the same 1-7 convention as
 //    everywhere else: 1=Idle 2=Three 3=Two 4=One 5=Start 6=Gameplay 7=Results
 //  - "/player_active" (3 int32 args) -- p1,p2,p3 active booleans (0/1),
 //    see playerActive[] and boardIdleOverride in loop()
+//  - "/player_result" (3 int32 args) -- p1,p2,p3 round result, 0=Try Again
+//    1=Winner 2=2nd place 3=3rd place -- see playerResult[] and
+//    applyResultEffect() in loop()
+// TD's remote-control cue sends /player_active and /player_result as two
+// back-to-back packets on the same tick, so this drains up to
+// MAX_PACKETS_PER_CALL queued packets per call (rather than just one) --
+// otherwise the second packet of a burst would sit queued for up to another
+// loop() pass (~95ms, see Section 8B) before being applied. The cap just
+// keeps a flood of UDP traffic from starving the rest of loop() (ADC
+// sampling, LEDs); it's well above the 1-2 packets a normal burst has.
 // Minimal parse to match the minimal encoder above -- no third-party OSC lib.
 void checkForStateUpdate() {
-  int packetSize = udp.parsePacket();
-  if (packetSize <= 0) return;
+  const int MAX_PACKETS_PER_CALL = 8;
 
-  uint8_t inBuf[64];
-  int len = udp.read(inBuf, sizeof(inBuf) - 1);
-  if (len <= 0) return;
-  inBuf[len] = 0;
+  for (int packetsHandled = 0; packetsHandled < MAX_PACKETS_PER_CALL; packetsHandled++) {
+    int packetSize = udp.parsePacket();
+    if (packetSize <= 0) break;
 
-  const char* address = (char*)inBuf;
-  size_t offset = oscPad4(strlen(address) + 1);
-  if (offset + 4 > (size_t)len) return;
+    uint8_t inBuf[64];
+    int len = udp.read(inBuf, sizeof(inBuf) - 1);
+    if (len <= 0) continue;
+    inBuf[len] = 0;
 
-  const char* typeTag = (char*)(inBuf + offset);
-  if (typeTag[0] != ',') return;
-  int argCount = strlen(typeTag) - 1;
-  offset += oscPad4(strlen(typeTag) + 1);
+    const char* address = (char*)inBuf;
+    size_t offset = oscPad4(strlen(address) + 1);
+    if (offset + 4 > (size_t)len) continue;
 
-  int values[3];
-  for (int i = 0; i < argCount && i < 3; i++) {
-    if (typeTag[1 + i] != 'i') return;
-    if (offset + 4 > (size_t)len) return;
-    values[i] = (int)(((uint32_t)inBuf[offset] << 24) | ((uint32_t)inBuf[offset + 1] << 16) |
-                       ((uint32_t)inBuf[offset + 2] << 8) | (uint32_t)inBuf[offset + 3]);
-    offset += 4;
-  }
+    const char* typeTag = (char*)(inBuf + offset);
+    if (typeTag[0] != ',') continue;
+    int argCount = strlen(typeTag) - 1;
+    offset += oscPad4(strlen(typeTag) + 1);
 
-  if (strcmp(address, "/game_state") == 0 && argCount >= 1) {
-    currentGameState = values[0];
-  } else if (strcmp(address, "/player_active") == 0 && argCount >= 3) {
-    playerActive[0] = values[0] != 0;
-    playerActive[1] = values[1] != 0;
-    playerActive[2] = values[2] != 0;
+    int values[3];
+    bool malformed = false;
+    for (int i = 0; i < argCount && i < 3; i++) {
+      if (typeTag[1 + i] != 'i' || offset + 4 > (size_t)len) {
+        malformed = true;
+        break;
+      }
+      values[i] = (int)(((uint32_t)inBuf[offset] << 24) | ((uint32_t)inBuf[offset + 1] << 16) |
+                         ((uint32_t)inBuf[offset + 2] << 8) | (uint32_t)inBuf[offset + 3]);
+      offset += 4;
+    }
+    if (malformed) continue;
+
+    if (strcmp(address, "/game_state") == 0 && argCount >= 1) {
+      currentGameState = values[0];
+    } else if (strcmp(address, "/player_active") == 0 && argCount >= 3) {
+      playerActive[0] = values[0] != 0;
+      playerActive[1] = values[1] != 0;
+      playerActive[2] = values[2] != 0;
+    } else if (strcmp(address, "/player_result") == 0 && argCount >= 3) {
+      playerResult[0] = values[0];
+      playerResult[1] = values[1];
+      playerResult[2] = values[2];
+    }
   }
 }
 
@@ -557,7 +659,8 @@ LEDState countdownOrIdleLEDState(int channelIndex, int gameState) {
     return (channelIndex < litCount) ? LED_RED : LED_OFF;
   }
   if (gameState == 1) {
-    return flickerOn[channelIndex] ? LED_GREEN : LED_OFF;
+    if (!flickerOn[channelIndex]) return LED_OFF;
+    return flickerYellow[channelIndex] ? LED_YELLOW : LED_GREEN;
   }
   return LED_OFF; // Start, or anything unrecognized
 }
@@ -724,6 +827,20 @@ void loop() {
   bool boardIdleOverride = !playerActive[myPlayer - 1];
   int effectiveState = boardIdleOverride ? 1 : currentGameState;
 
+  // Result lighting effect (vegas chase / error flash): armed while in
+  // Gameplay/Results and this board's own player's result changes, held
+  // regardless of socket connections until effectiveState returns to Idle --
+  // which also covers boardIdleOverride, so an inactive player's board never
+  // fires one. See applyResultEffect()/startResultEffect() above.
+  if (effectiveState == 1) {
+    activeEffect = EFFECT_NONE;
+    lastEffectResult = -1;
+  } else if ((effectiveState == 6 || effectiveState == 7) &&
+             playerResult[myPlayer - 1] != lastEffectResult) {
+    lastEffectResult = playerResult[myPlayer - 1];
+    startResultEffect(lastEffectResult);
+  }
+
   bool allCorrect = true;
   bool matched[3] = { false, false, false };
 
@@ -772,7 +889,11 @@ void loop() {
       // Idle / Three / Two / One / Start: lighting is state-driven, not reading-driven.
       ledState = countdownOrIdleLEDState(i, effectiveState);
     }
-    setLEDState(channels[i].redPin, channels[i].greenPin, ledState);
+    // A held result effect (see above) takes over all 3 channels' LEDs at
+    // once via applyResultEffect() below, overriding ledState here.
+    if (activeEffect == EFFECT_NONE) {
+      setLEDState(channels[i].redPin, channels[i].greenPin, ledState);
+    }
 
     matched[i] = isMatch;
     if (!isMatch) {
@@ -803,6 +924,13 @@ void loop() {
     }
   }
 
+  // Render the held result effect (if any) across all 3 channels at once --
+  // done after the per-channel loop above since it overrides, rather than
+  // reads, each channel's LED.
+  if (activeEffect != EFFECT_NONE) {
+    applyResultEffect();
+  }
+
   // GAME WIN CONDITION: Triggered only when all three channels match their correct answers simultaneously
   if (allCorrect) {
     Serial.print(" *** GAME SOLVED: ALL PATCHES CORRECT! ***");
@@ -814,9 +942,9 @@ void loop() {
 
   // Throttle delay. checkForStateUpdate() (top of loop) only gets called once
   // per pass, so this delay -- plus the ~45ms of ADC averaging above it -- is
-  // also the worst-case latency between TD sending /game_state or
-  // /player_active and this board's LEDs reflecting it. Kept short (rather
-  // than the original 300ms) specifically so that's small relative to the
-  // 1-second countdown states (Three/Two/One) on stage.
+  // also the worst-case latency between TD sending /game_state,
+  // /player_active, or /player_result and this board's LEDs reflecting it.
+  // Kept short (rather than the original 300ms) specifically so that's small
+  // relative to the 1-second countdown states (Three/Two/One) on stage.
   delay(50);
 }

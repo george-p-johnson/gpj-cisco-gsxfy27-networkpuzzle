@@ -6,8 +6,12 @@
   const startBtn = document.querySelector('.pulse-btn.start');
   const boardStatusEl = document.getElementById('boardStatus');
   const connectionWarningEl = document.getElementById('connectionWarning');
+  const connectionWarningDetailEl = document.getElementById('connectionWarningDetail');
 
   const IDLE_STATE = 1;
+  const GAMEPLAY_STATE = 6;
+  const RESULTS_STATE = 7;
+  const RESULT_LABELS = { 1: 'WINNER', 2: '2ND PLACE', 3: '3RD PLACE' };
 
   const playerButtons = new Map(
     Array.from(document.querySelectorAll('.player-btn')).map((btn) => [
@@ -54,16 +58,46 @@
       gameStateEl.setAttribute('data-state', String(gameState));
       gameStateValue.textContent = gameStateLabel || `State ${gameState}`;
     }
-    for (const btn of playerButtons.values()) {
-      btn.disabled = gameState !== IDLE_STATE;
+  }
+
+  // A player's boards being offline overrides everything else -- the button
+  // stays disabled even during Idle, since there's nothing to play on.
+  function updatePlayerButtons(gameState, players, boardsReady) {
+    for (const [num, btn] of playerButtons) {
+      const ready = !boardsReady || boardsReady[num];
+      const active = Boolean(players && players[num]);
+      btn.disabled = gameState !== IDLE_STATE || (!ready && !active);
+      btn.classList.toggle('boards-offline', !ready);
+      btn.title = ready ? '' : 'Boards offline for this player';
     }
   }
 
-  function applyPlayers(players) {
+  // Result labels only mean anything for an active player while a round is
+  // actually underway/decided. 0 is ambiguous before then -- during
+  // Gameplay it just means "still going" (not yet finished), and only reads
+  // as "Try Again" once Results locks it in. Outside those two states (or
+  // for an inactive player), ignore playerResults entirely and fall back to
+  // the plain ON/OFF/NO BOARDS label.
+  function resultLabel(gameState, result) {
+    if (RESULT_LABELS[result]) return RESULT_LABELS[result];
+    if (gameState === RESULTS_STATE) return 'TRY AGAIN';
+    return null;
+  }
+
+  function applyPlayers(players, boardsReady, gameState, playerResults) {
     for (const [num, btn] of playerButtons) {
       const active = Boolean(players[num]);
+      const ready = !boardsReady || boardsReady[num];
+      const showResult = active && (gameState === GAMEPLAY_STATE || gameState === RESULTS_STATE);
+      const result = showResult ? playerResults && playerResults[num] : undefined;
+      const label = showResult ? resultLabel(gameState, result) : null;
       btn.classList.toggle('active', active);
-      btn.querySelector('.state').textContent = active ? 'ON' : 'OFF';
+      if (label) {
+        btn.dataset.result = String(result || 0);
+      } else {
+        delete btn.dataset.result;
+      }
+      btn.querySelector('.state').textContent = label || (active ? 'ON' : ready ? 'OFF' : 'NO BOARDS');
     }
   }
 
@@ -72,8 +106,16 @@
     startBtn.disabled = gameState !== IDLE_STATE || !anyPlayerActive || Boolean(anyConnected);
   }
 
-  function updateConnectionWarning(gameState, anyConnected) {
-    connectionWarningEl.hidden = !(gameState === IDLE_STATE && anyConnected);
+  function updateConnectionWarning(gameState, anyConnected, connectedCables) {
+    const show = gameState === IDLE_STATE && anyConnected;
+    connectionWarningEl.hidden = !show;
+    if (show && connectedCables && connectedCables.length) {
+      connectionWarningDetailEl.textContent = connectedCables
+        .map((c) => `Player ${c.player} Q${c.question}`)
+        .join(', ');
+    } else {
+      connectionWarningDetailEl.textContent = '';
+    }
   }
 
   function connect() {
@@ -93,10 +135,11 @@
       }
       if (msg.type === 'state') {
         setStatus(msg.connected);
-        applyPlayers(msg.players);
+        applyPlayers(msg.players, msg.boardsReady, msg.gameState, msg.playerResults);
         applyGameState(msg.gameState, msg.gameStateLabel);
+        updatePlayerButtons(msg.gameState, msg.players, msg.boardsReady);
         updateStartButton(msg.gameState, msg.players, msg.anyConnected);
-        updateConnectionWarning(msg.gameState, msg.anyConnected);
+        updateConnectionWarning(msg.gameState, msg.anyConnected, msg.connectedCables);
         applyWaveshare(msg.waveshare);
       }
     });

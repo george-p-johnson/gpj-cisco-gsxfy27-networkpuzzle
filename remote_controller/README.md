@@ -3,8 +3,8 @@
 A small web app for operating the GSXFY27 Network Puzzle game from a phone,
 tablet, or laptop on the same network as the show PC.
 
-- 3 toggle buttons: **Activate Player 1 / 2 / 3** (only enabled while the game state is Idle)
-- 2 pulse buttons: **Start Game** (only enabled while the game state is Idle, at least one player is active, *and* no board has a patch cord still plugged in from the previous game -- shows a docent-facing reminder to unplug them otherwise), **Reset Game** (also auto-activates any player not already ON, so a fresh reset defaults to all 3 players ready)
+- 3 toggle buttons: **Activate Player 1 / 2 / 3** (only enabled while the game state is Idle *and* that player's boards are online -- Player 1 needs boards 1/2, Player 2 needs boards 3/4, Player 3 needs boards 5/6; shows "NO BOARDS" otherwise)
+- 2 pulse buttons: **Start Game** (only enabled while the game state is Idle, at least one player is active, *and* no board has a patch cord still plugged in from the previous game -- shows a docent-facing reminder naming exactly which player/question is still connected, e.g. "Player 2 Q4", otherwise), **Reset Game** (also auto-activates any player not already ON *and* whose boards are online, so a fresh reset defaults to all reachable players ready)
 - A live **Connected / Disconnected** indicator for the link to TouchDesigner
 - A live **game state** display (Idle / Three / Two / One / Start / Gameplay / Results)
 - A live **Boards** indicator showing which of the 6 ESP32 question boards are currently reporting, grouped by panel
@@ -79,17 +79,33 @@ same activation messages it would if someone had toggled them by hand.
 | Heartbeat | `/remote/heartbeat` | Sent ~every 1s; drives Connected/Disconnected |
 | Game state | `/remote/game_state` | Int `1`-`7`; drives the game-state display |
 | Player active | `/remote/player_active` | 3 ints `[p1, p2, p3]` as 0/1; authoritative -- overwrites the server's local player state on receipt (see below) |
-| Board status | `/remote/waveshare/1` ... `/remote/waveshare/6` | `1` = board reporting recently, `0` = stale/offline; drives the Boards indicator |
-| Board detail | `/remote/waveshare_detail/1` ... `/6` | 3 ints: `ch1Index, ch2Index, ch3Index` (0-10 resistor classification, see below) -- powers the private admin status page only |
+| Player result | `/remote/player_result` | 3 ints `[p1, p2, p3]`, placement code `0`-`3`: `0` = Try Again, `1` = Winner, `2` = 2nd place, `3` = 3rd place. TD flips `1`-`3` live per player as they finish during Gameplay; `0` is set for anyone still unfinished at the Gameplay->Results boundary once time runs out. Drives the WINNER/2ND PLACE/3RD PLACE/TRY AGAIN label on each active player's button, shown only while game state is Gameplay or Results (otherwise the plain ON/OFF/NO BOARDS label is shown, ignoring any stale placement from a previous round) |
+| Board status | `/remote/waveshare/1` ... `/remote/waveshare/6` | `1` = board reporting recently, `0` = stale/offline; drives the Boards indicator, and (paired up) the per-player `boardsReady` flags below |
+| Board detail | `/remote/waveshare_detail/1` ... `/6` | 3 ints: `ch1Index, ch2Index, ch3Index` (0-10 resistor classification, see below) -- raw per-channel readings power the private admin status page only |
 
-Board detail also drives a public, non-admin-gated derived flag: `anyConnected`
-in the state broadcast is `true` whenever any channel on any board reads
-other than `10` (NONE) -- i.e. something is still plugged in somewhere. This
-blocks the **Start Game** button and shows the docent reminder above (server
-also rejects a `start_game` pulse outright while it's true, so this can't be
-bypassed by a stale/cached page). It's presence-only -- it never reveals
-which resistor is plugged in or whether it's correct, so it's safe to send
-to every connected client, not just admin ones.
+Board status also drives a public, non-admin-gated `boardsReady` map in the
+state broadcast: Player 1 is ready only when boards 1 *and* 2 are both
+reporting, Player 2 needs boards 3/4, Player 3 needs boards 5/6 (same
+board->panel mapping as `question_game/CLAUDE.md` Section 6D). A player
+whose boards aren't ready has its **Activate Player N** button disabled
+(shown as "NO BOARDS") even while the game state is Idle, and is skipped by
+Reset Game's auto-activate. The server also rejects a `toggle` trying to
+turn that player ON outright, so this can't be bypassed by a stale/cached
+page -- though an already-active player can still be toggled back OFF if its
+boards drop out mid-idle.
+
+Board detail also drives two public, non-admin-gated derived fields:
+* `anyConnected` -- `true` whenever any channel on any board reads other
+  than `10` (NONE) -- i.e. something is still plugged in somewhere. This
+  blocks the **Start Game** button and shows the docent reminder above
+  (server also rejects a `start_game` pulse outright while it's true, so
+  this can't be bypassed by a stale/cached page).
+* `connectedCables` -- an array of `{ player, question }` pairs (question
+  `1`-`6`) naming exactly which sockets are still plugged in, rendered under
+  the docent reminder (e.g. "Player 2 Q4, Player 3 Q1"). Both fields are
+  presence-only -- neither reveals which resistor is plugged in or whether
+  it's correct, so both are safe to send to every connected client, not just
+  admin ones.
 
 Resistor classification index (same 0-10 scale the ESP32 firmware uses and
 the admin page translates to a label -- see `public-admin/app.js`

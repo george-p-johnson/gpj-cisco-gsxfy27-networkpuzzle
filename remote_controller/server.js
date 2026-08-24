@@ -49,6 +49,22 @@ const state = {
   // in place. Not admin-gated: it's presence-only, doesn't reveal any actual
   // reading or the answer key, so it's safe on the public state broadcast.
   anyConnected: false,
+  // Which player/question pairs currently have a patch cord plugged in
+  // (mirrors anyConnected but broken out per player/question so the docent
+  // knows exactly where to look instead of just "somewhere"). Same privacy
+  // reasoning as anyConnected -- reveals presence, not which resistor.
+  connectedCables: [],
+  // Per-player readiness: a player is only ready to activate if both of its
+  // boards are currently reporting. Player 1 -> boards 1/2, Player 2 ->
+  // boards 3/4, Player 3 -> boards 5/6 (same board->panel mapping as
+  // question_game/CLAUDE.md Section 6D).
+  boardsReady: { 1: false, 2: false, 3: false },
+  // Per-player placement, from /remote/player_result: 0 = Try Again, 1 =
+  // Winner, 2 = 2nd place, 3 = 3rd place. TD flips 1-3 live as players
+  // finish during Gameplay; 0 is set for anyone still unfinished once time
+  // runs out, at the Gameplay->Results boundary. Defaults to 0 for everyone
+  // until TD's first send.
+  playerResults: { 1: 0, 2: 0, 3: 0 },
 };
 
 const EMPTY_INDEX = 10;
@@ -59,6 +75,37 @@ function boardHasConnection(detail) {
 
 function computeAnyConnected() {
   return Object.values(state.waveshareDetail).some(boardHasConnection);
+}
+
+// board -> { player, startQuestion }, same mapping as loadAnswerIndex()
+// below and question_game/CLAUDE.md Section 6D.
+function boardToPlayerAndStartQuestion(board) {
+  const player = Math.ceil(board / 2);
+  const startQuestion = ((board - 1) % 2) * 3 + 1;
+  return { player, startQuestion };
+}
+
+function computeConnectedCables() {
+  const cables = [];
+  for (const [boardStr, detail] of Object.entries(state.waveshareDetail)) {
+    if (!detail) continue;
+    const { player, startQuestion } = boardToPlayerAndStartQuestion(Number(boardStr));
+    WAVESHARE_DETAIL_FIELDS.forEach((field, i) => {
+      if (detail[field] !== undefined && detail[field] !== EMPTY_INDEX) {
+        cables.push({ player, question: startQuestion + i });
+      }
+    });
+  }
+  cables.sort((a, b) => (a.player - b.player) || (a.question - b.question));
+  return cables;
+}
+
+function computeBoardsReady() {
+  return {
+    1: Boolean(state.waveshare[1] && state.waveshare[2]),
+    2: Boolean(state.waveshare[3] && state.waveshare[4]),
+    3: Boolean(state.waveshare[5] && state.waveshare[6]),
+  };
 }
 
 const ANSWER_TABLE_PATH = path.join(__dirname, '..', 'answer_table.tsv');
@@ -171,6 +218,17 @@ oscPort.on('message', (msg) => {
       state.players = next;
       broadcastState();
     }
+  } else if (msg.address === '/remote/player_result') {
+    // 0-3 placement code per player -- see state.playerResults above.
+    const next = {
+      1: Number(oscArgValue(msg, 0)) || 0,
+      2: Number(oscArgValue(msg, 1)) || 0,
+      3: Number(oscArgValue(msg, 2)) || 0,
+    };
+    if (next[1] !== state.playerResults[1] || next[2] !== state.playerResults[2] || next[3] !== state.playerResults[3]) {
+      state.playerResults = next;
+      broadcastState();
+    }
   } else {
     const waveshareMatch = msg.address.match(WAVESHARE_ADDR_RE);
     const waveshareDetailMatch = msg.address.match(WAVESHARE_DETAIL_ADDR_RE);
@@ -179,6 +237,7 @@ oscPort.on('message', (msg) => {
       const live = Boolean(Number(oscArgValue(msg, 0)));
       if (state.waveshare[board] !== live) {
         state.waveshare[board] = live;
+        state.boardsReady = computeBoardsReady();
         broadcastState();
       }
     } else if (waveshareDetailMatch) {
@@ -191,8 +250,11 @@ oscPort.on('message', (msg) => {
       broadcastAdminState();
 
       const anyConnected = computeAnyConnected();
-      if (state.anyConnected !== anyConnected) {
+      const connectedCables = computeConnectedCables();
+      const cablesChanged = JSON.stringify(connectedCables) !== JSON.stringify(state.connectedCables);
+      if (state.anyConnected !== anyConnected || cablesChanged) {
         state.anyConnected = anyConnected;
+        state.connectedCables = connectedCables;
         broadcastState();
       }
     }
@@ -269,7 +331,10 @@ function currentStateMessage() {
     gameState: state.gameState,
     gameStateLabel: GAME_STATE_NAMES[state.gameState] || null,
     waveshare: state.waveshare,
+    boardsReady: state.boardsReady,
     anyConnected: state.anyConnected,
+    connectedCables: state.connectedCables,
+    playerResults: state.playerResults,
   });
 }
 
@@ -314,6 +379,10 @@ wss.on('connection', (ws, req) => {
     if (msg.type === 'toggle' && [1, 2, 3].includes(msg.player)) {
       if (state.gameState !== IDLE_STATE) return;
       const next = !state.players[msg.player];
+      // Only block turning a player ON while its boards are offline --
+      // still allow turning an already-active player back OFF regardless,
+      // in case boards dropped out mid-idle after the player was activated.
+      if (next && !state.boardsReady[msg.player]) return;
       state.players[msg.player] = next;
       sendOSC(`/remote/player/${msg.player}`, next);
       broadcastState();
@@ -326,7 +395,9 @@ wss.on('connection', (ws, req) => {
       sendOSC(`/remote/${msg.action}`, 1);
 
       if (msg.action === 'reset_game') {
-        const playersToActivate = [1, 2, 3].filter((player) => !state.players[player]);
+        // Only auto-activate players whose boards are actually reporting --
+        // no point flipping a player ON that can't be played.
+        const playersToActivate = [1, 2, 3].filter((player) => !state.players[player] && state.boardsReady[player]);
         for (const player of playersToActivate) {
           state.players[player] = true;
         }

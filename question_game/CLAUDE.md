@@ -13,10 +13,11 @@ The installation is **six physical Waveshare ESP32-S3-ETH boards, all running th
 * **Match Indicator LEDs:** Each channel has a dedicated bi-color LED:
   - **Green LED:** Illuminates when the patch cord connects a question socket to its **correct** answer socket (as defined by that board's configuration).
   - **Red LED:** Illuminates if the patch cord is connected to an **incorrect** answer socket. An **unplugged** (open circuit) socket shows **off**, not red -- see Section 8B.
-  - LED behavior above applies during **Gameplay**/**Results**; during **Idle**/**Three**/**Two**/**One**/**Start** the LEDs instead follow the countdown/lighting sequence driven by the controller (Section 7D, Section 8B/8C), independent of what's actually plugged in. During **Idle**, this means a randomized green flicker (Section 8C), mimicking an Ethernet switch port's activity LED, rather than solid off.
+  - LED behavior above applies during **Gameplay**/**Results**; during **Idle**/**Three**/**Two**/**One**/**Start** the LEDs instead follow the countdown/lighting sequence driven by the controller (Section 7D, Section 8B/8C), independent of what's actually plugged in. During **Idle**, this means a mostly-on green flicker with occasional yellow blips (Section 8C), mimicking an Ethernet switch port's link/activity LED, rather than solid off.
 * **Game Victory State:** A per-board success signal is triggered only when all three channels have correct matches simultaneously.
+* **Round Result Lighting:** Once TouchDesigner reports this player's round result (win / 2nd / 3rd / try again), the board runs a themed flourish over all three LEDs -- a colored "vegas slot machine" chase for a placement, or a red on/off error flash for a miss -- held regardless of what's plugged in until the game returns to Idle. See Section 7D and Section 8D.
 * **Variable Configurations:** Correct answers are not hardcoded in the firmware. Each board reads its assigned questions and their correct answers from a shared `answer_table.tsv` on its SD card, selecting the right 3 rows based on a `device.cfg` file that names which of the six boards it is. This means the entire installation's questions can be re-authored by editing one spreadsheet-like file and copying it to six SD cards -- no reflashing, no hardware rewiring. See **Section 6**.
-* **Networked Telemetry (Two-Way):** Each board reports its live channel states to a central game controller (TouchDesigner) over Ethernet via OSC, and also receives the current game state and per-player active flags back from the controller to drive its lighting -- a board whose player is inactive stays on idle lighting no matter what state the rest of the game is in. See **Section 7**.
+* **Networked Telemetry (Two-Way):** Each board reports its live channel states to a central game controller (TouchDesigner) over Ethernet via OSC, and also receives the current game state, per-player active flags, and per-player round results back from the controller to drive its lighting -- a board whose player is inactive stays on idle lighting no matter what state the rest of the game is in, and a board whose player has a round result runs its result lighting effect until the game returns to Idle. See **Section 7** and **Section 8D**.
 
 ---
 
@@ -277,14 +278,15 @@ The OSC packet encoder is hand-rolled (`sendOSCInts()` in `question_game.ino`) r
 * `ethConnected` is tracked via the `Network.onEvent()` callback (`ARDUINO_EVENT_ETH_GOT_IP` / `..._LOST_IP` / `..._DISCONNECTED`) and gates whether `sendGameStateOSC()` actually sends -- avoids trying to send before the link is ready.
 
 ### D. Controller → Board: Game-State Lighting & Player-Active State
-Boards also **listen** for incoming UDP: TouchDesigner broadcasts the current game state (and which players are active) to `192.168.50.255:9003`, and each board reacts by driving its LEDs per Section 8B. This reuses the same `udp` object as outgoing telemetry (`udp.begin(STATE_LISTEN_PORT)` in `setup()`, once Ethernet is up) -- `NetworkUDP` supports simultaneous send (`beginPacket`/`write`/`endPacket`) and receive (`parsePacket`/`read`) on one instance, no second socket needed.
+Boards also **listen** for incoming UDP: TouchDesigner broadcasts the current game state (which players are active, and each player's round result) to `192.168.50.255:9003`, and each board reacts by driving its LEDs per Section 8B/8D. This reuses the same `udp` object as outgoing telemetry (`udp.begin(STATE_LISTEN_PORT)` in `setup()`, once Ethernet is up) -- `NetworkUDP` supports simultaneous send (`beginPacket`/`write`/`endPacket`) and receive (`parsePacket`/`read`) on one instance, no second socket needed.
 
-Two addresses are handled on this port:
+Three addresses are handled on this port:
 
 | Address | Args | Purpose |
 | :--- | :--- | :--- |
 | `/game_state` | 1 int32 | The game state, using the same 1-7 convention the remote controller uses (see `../remote_controller/README.md`) |
 | `/player_active` | 3 int32 (p1, p2, p3 as 0/1) | Which of the 3 players are currently active -- see below |
+| `/player_result` | 3 int32 (p1, p2, p3 as 0-3) | Each player's round result -- see below and Section 8D |
 
 `/game_state` values:
 
@@ -298,11 +300,24 @@ Two addresses are handled on this port:
 | 6 | Gameplay |
 | 7 | Results |
 
-`currentGameState` defaults to `1` (Idle) at boot, before TD has sent anything. `playerActive[3]` defaults to all-`true` at boot, so a board's lighting is unchanged unless/until TD actually sends `/player_active`.
+`/player_result` values (per player):
+
+| Value | Meaning |
+| :---: | --- |
+| 0 | Try Again |
+| 1 | Winner |
+| 2 | 2nd place |
+| 3 | 3rd place |
+
+`currentGameState` defaults to `1` (Idle) at boot, before TD has sent anything. `playerActive[3]` defaults to all-`true` at boot, so a board's lighting is unchanged unless/until TD actually sends `/player_active`. `playerResult[3]` defaults to `-1, -1, -1` at boot -- deliberately outside the real `0`-`3` range -- so a board doesn't mistake "no result received yet" for an actual result.
 
 **Player-active override:** Each board knows which player it belongs to (`myPlayer`, computed at boot from `deviceIndex` -- boards 1/2 -> P1, 3/4 -> P2, 5/6 -> P3, same mapping as Section 6D). If that player is inactive (`playerActive[myPlayer-1] == false`), the board treats itself as Idle for LED purposes regardless of the actual `currentGameState` -- see `boardIdleOverride`/`effectiveState` in `loop()`. This lets a multiplayer variant leave un-used players' boards flickering idle throughout Three/Two/One/Gameplay/Results instead of running the countdown/match lighting for a player who isn't playing. Readings, matching, and OSC telemetry are unaffected -- only the LED decision is overridden.
 
-Parsing (`checkForStateUpdate()` in `question_game.ino`) is a minimal hand-rolled OSC reader, mirroring the hand-rolled encoder already used for outgoing telemetry -- same reasoning, avoids a third-party OSC library dependency. It now branches on the address and type-tag arg count to support both 1-arg and 3-arg messages on the same socket.
+**Result override:** a board only ever reacts to its own player's slot, `playerResult[myPlayer-1]` -- see Section 8D for how a change in that value is turned into a held lighting effect.
+
+**TD's actual send pattern:** the controller's remote-control cue sends `/player_active` and `/player_result` as two back-to-back packets on the same tick (both read off `op.PROJECT`'s per-player status/result pars). Because of that, `checkForStateUpdate()` drains up to `MAX_PACKETS_PER_CALL` (`8`) queued packets per call instead of just one -- otherwise the second packet of a burst would sit queued for up to another `loop()` pass (~95ms, Section 8B) before being applied. The cap exists only to keep a flood of UDP traffic from starving the rest of `loop()` (ADC sampling, LEDs); normal bursts are 1-2 packets.
+
+Parsing (`checkForStateUpdate()` in `question_game.ino`) is a minimal hand-rolled OSC reader, mirroring the hand-rolled encoder already used for outgoing telemetry -- same reasoning, avoids a third-party OSC library dependency. It branches on the address and type-tag arg count to support both 1-arg and 3-arg messages on the same socket.
 
 ### E. Diagnostic Tool
 [`ETH_Test/ETH_Test.ino`](../ETH_Test/ETH_Test.ino) is a minimal standalone sketch (link up, static IP, no SD/game logic) for validating Ethernet connectivity in isolation -- use this first if network-related symptoms come up again, before assuming the integration code is at fault.
@@ -327,31 +342,51 @@ int correctAnswers[3] = {
 
 ### B. Logic Processing Flow
 On every iteration of the `loop()`:
-0. **Check for a game-state update:** `checkForStateUpdate()` (Section 7D) polls for an incoming `/game_state` or `/player_active` broadcast and updates `currentGameState`/`playerActive[]` if one arrived; otherwise it's a no-op and the previous values carry over. `updateIdleFlicker()` then advances each channel's randomized idle-flicker timer (Section 8C) unconditionally, so its timing stays continuous whether or not it's currently visible.
+0. **Check for game-state updates:** `checkForStateUpdate()` (Section 7D) drains up to `MAX_PACKETS_PER_CALL` queued `/game_state`, `/player_active`, and/or `/player_result` broadcasts and updates `currentGameState`/`playerActive[]`/`playerResult[]` for each one that arrived, in order; otherwise it's a no-op and the previous values carry over. `updateIdleFlicker()` then advances each channel's randomized idle-flicker timer (Section 8C) unconditionally, so its timing stays continuous whether or not it's currently visible.
 1. **Compute effective state:** `boardIdleOverride = !playerActive[myPlayer-1]`; `effectiveState = boardIdleOverride ? 1 : currentGameState`. All LED decisions below use `effectiveState`, not `currentGameState` directly -- see Section 7D.
-2. **Reset Victory Tracker:** A boolean flag `allCorrect` is initialized to `true`.
-3. **Channel Polling:** For each channel `i` from `0` to `2`:
+2. **Arm/clear the result effect:** if `effectiveState` is Idle, any held result effect (Section 8D) is cleared; otherwise, if `effectiveState` is Gameplay/Results and `playerResult[myPlayer-1]` differs from the value the current effect (if any) was started for, a new one is started via `startResultEffect()`.
+3. **Reset Victory Tracker:** A boolean flag `allCorrect` is initialized to `true`.
+4. **Channel Polling:** For each channel `i` from `0` to `2`:
    - Measure the smoothed analog voltage ($V_{\text{out}}$) on `ANALOG_PINS[i]` after flushing the charge.
    - Map the voltage value to its resistor classification index `detectedIndex` using the Midpoint Decision boundaries.
    - Apply debounce (Section 3C) to promote `detectedIndex` to `stableIndex[i]`.
    - Compare `stableIndex[i]` with the target `correctAnswers[i]` -- this comparison (`matched[i]`, `allCorrect`) always runs and is always sent in telemetry, regardless of `currentGameState`/`effectiveState`.
-   - Update LEDs, gated by `effectiveState`:
-     - **Idle:** flickering green (Section 8C), regardless of what's plugged in.
+   - Update LEDs, gated by `effectiveState` -- **unless** a result effect (Section 8D) is currently active, in which case it overrides all three channels' LEDs regardless of readings or `effectiveState`:
+     - **Idle:** flickering green/yellow (Section 8C), regardless of what's plugged in.
      - **Start:** off, regardless of what's plugged in.
      - **Three / Two / One:** a countdown, independent of actual readings -- one more channel lights red per step (CH1 only → CH1+CH2 → all three).
      - **Gameplay / Results:** reflects the real reading -- green if matched, red if plugged but wrong, off if the socket is empty (unplugged) or the classification is still debouncing.
    - Output Serial telemetry details (measured mV, detected resistor name, match status).
-4. **Master Win Assertion:** If `allCorrect` remains `true` after polling all three channels, output the unified game win telemetry (`*** GAME SOLVED: ALL PATCHES CORRECT! ***`).
-5. **OSC Telemetry:** Send this board's current state to the game controller (Section 7B).
-6. **Throttle Delay:** A final $50\text{ms}$ delay throttles the scanning loop. Originally $300\text{ms}$ (to conserve processing cycles and provide human-readable serial logs), but shortened -- since `checkForStateUpdate()` (step 0) only runs once per loop pass, this delay is also the dominant term in the worst-case latency between TD sending `/game_state`/`/player_active` and this board's LEDs reflecting it. At $50\text{ms}$ (plus ~$45\text{ms}$ of ADC averaging below it, for a ~$95\text{ms}$ total loop period), that latency stays small relative to the 1-second Three/Two/One countdown states on stage. Neither ESP32-S3 processing headroom nor Serial throughput (already non-blocking via `Serial.setTxTimeoutMs(0)`) are a concern at this rate.
+5. **Render the result effect:** if one is active, `applyResultEffect()` (Section 8D) drives all 3 channels' LEDs as a single animation, after the per-channel loop above.
+6. **Master Win Assertion:** If `allCorrect` remains `true` after polling all three channels, output the unified game win telemetry (`*** GAME SOLVED: ALL PATCHES CORRECT! ***`).
+7. **OSC Telemetry:** Send this board's current state to the game controller (Section 7B).
+8. **Throttle Delay:** A final $50\text{ms}$ delay throttles the scanning loop. Originally $300\text{ms}$ (to conserve processing cycles and provide human-readable serial logs), but shortened -- since `checkForStateUpdate()` (step 0) only runs once per loop pass, this delay is also the dominant term in the worst-case latency between TD sending `/game_state`/`/player_active`/`/player_result` and this board's LEDs reflecting it. At $50\text{ms}$ (plus ~$45\text{ms}$ of ADC averaging below it, for a ~$95\text{ms}$ total loop period), that latency stays small relative to the 1-second Three/Two/One countdown states on stage. Neither ESP32-S3 processing headroom nor Serial throughput (already non-blocking via `Serial.setTxTimeoutMs(0)`) are a concern at this rate.
 
 ### C. Idle Lighting: "Ethernet Switch" Flicker
-While a channel is showing Idle lighting (either because `currentGameState` really is Idle, or because `boardIdleOverride` forces it there for an inactive player -- Section 7D), the LED flickers green instead of sitting solid or off, mimicking an Ethernet switch port's link/activity LED.
+While a channel is showing Idle lighting (either because `currentGameState` really is Idle, or because `boardIdleOverride` forces it there for an inactive player -- Section 7D), the LED flickers green (with occasional yellow) instead of sitting solid or off, mimicking an Ethernet switch port's link/activity LED.
 
 * `updateIdleFlicker()` runs unconditionally at the top of every `loop()` iteration (not gated by state), so each channel's flicker timing free-runs continuously rather than restarting whenever a board re-enters Idle.
 * Each of the 3 channels has its own independent on/off timer (`flickerOn[3]`, `flickerNextToggleMs[3]`) -- they are not synchronized, so the three LEDs flicker at different, random moments, like independent switch ports rather than a single synchronized blink.
-* Each toggle rolls a new random duration: ON bursts are short (`40-150ms`), OFF gaps are longer (`150-600ms`) -- mostly-off punctuated by quick flashes, matching the look of intermittent traffic rather than a steady blink.
-* The main loop advances roughly every ~95ms (Section 8B step 6), so flicker updates happen at that cadence in practice -- still clearly irregular and non-synchronized across channels, and now close enough to the shortest ON burst (40ms) that the flicker reads as genuinely quick rather than just "irregular."
+* Each toggle rolls a new random duration: ON bursts are long (`300-700ms`), OFF gaps are short (`60-180ms`) -- mostly-on punctuated by brief dark gaps, reading as a live link light rather than a mostly-dark one (this is the reverse of the durations used before this pass, which were mostly-off).
+* Each ON burst also rolls a `FLICKER_YELLOW_CHANCE_PCT` (default `20%`) chance of rendering yellow instead of green (`flickerYellow[3]`), mimicking a switch port's occasional amber/collision activity blip.
+* The main loop advances roughly every ~95ms (Section 8B step 8), so flicker updates happen at that cadence in practice -- still clearly irregular and non-synchronized across channels; since OFF gaps can be as short as 60ms, an occasional one may get skipped entirely on a given pass, which reads as brief and irregular rather than a steady blink.
+
+### D. Result Lighting Effects: Win/Placement Chases & Try-Again Flash
+Once a round enters Gameplay or Results, TD additionally reports each player's round outcome via `/player_result` (Section 7D). A board reacts to *its own* player's result (`playerResult[myPlayer-1]`) by taking over all three of its LEDs with a themed animation, independent of what's actually plugged into its sockets -- and holds that animation until the game returns to Idle, regardless of socket connections.
+
+* **Trigger:** on each `loop()` pass (Section 8B step 2), if `effectiveState` is Gameplay (`6`) or Results (`7`) and `playerResult[myPlayer-1]` differs from the value the currently-held effect (if any) was started for (`lastEffectResult`), `startResultEffect()` fires and latches the new value. Because `playerResult[]` defaults to `-1` (Section 7D) and `lastEffectResult` starts at `-1` too, a board that hasn't received a result yet stays quiet instead of firing an effect off its own startup default.
+* **Hold behavior:** while an effect is active, `applyResultEffect()` overrides the normal Gameplay/Results reading-based LEDs (Section 8B step 4) entirely, for all 3 channels at once -- unplugging or replugging a cord has no visible effect on the lighting. The effect is cleared (and `lastEffectResult` reset to `-1`) only when `effectiveState` returns to Idle (`1`), which covers both a real `/game_state` Idle broadcast and `boardIdleOverride` for an inactive player -- so an inactive player's board can never fire a result effect in the first place.
+* **`playerResult` value → effect:**
+
+| Value | Meaning | Effect |
+| :---: | :--- | :--- |
+| `0` | Try Again | All 3 channels flash red on/off together every `TRY_AGAIN_FLASH_MS` (`300ms`) -- a blinking error indicator. |
+| `1` | Winner | Green vegas-style chase (see below). |
+| `2` | 2nd place | Yellow vegas-style chase. |
+| `3` | 3rd place | Red vegas-style chase. |
+
+* **Vegas chase animation:** a 4-beat cycle advancing every `CHASE_STEP_MS` (`90ms`), driven by `effectStep` (`0`-`3`): beats `0`-`2` light only the corresponding channel (CH1 → CH2 → CH3) in the result's color, with the other two off; beat `3` lights all three together as a "jackpot" flash, then the cycle repeats.
+* **Implementation:** `startResultEffect()`/`applyResultEffect()` in `question_game.ino`. `applyResultEffect()` is called once per `loop()` pass (not once per channel) after the per-channel reading loop, so it can drive all three LEDs as a single animation rather than three independent per-channel decisions.
 
 ---
 
