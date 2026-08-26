@@ -44,15 +44,17 @@ const state = {
   waveshareDetail: { 1: null, 2: null, 3: null, 4: null, 5: null, 6: null },
   // True if any socket on any board reads other than NONE (10) -- i.e. a
   // patch cord is still plugged in somewhere, most likely left over from the
-  // previous game. Blocks Start Game (see the pulse handler below) so a
-  // docent can't accidentally start a new round with stale connections still
-  // in place. Not admin-gated: it's presence-only, doesn't reveal any actual
+  // previous game. Drives the public connection-warning banner (see the
+  // client). Not admin-gated: it's presence-only, doesn't reveal any actual
   // reading or the answer key, so it's safe on the public state broadcast.
   anyConnected: false,
   // Which player/question pairs currently have a patch cord plugged in
   // (mirrors anyConnected but broken out per player/question so the docent
   // knows exactly where to look instead of just "somewhere"). Same privacy
-  // reasoning as anyConnected -- reveals presence, not which resistor.
+  // reasoning as anyConnected -- reveals presence, not which resistor. Start
+  // Game only actually gets blocked once this list is longer than
+  // CABLE_BLOCK_THRESHOLD (see the pulse handler below) -- a single stray
+  // reading (P1q1's socket is finicky) shouldn't stop a round.
   connectedCables: [],
   // Per-player readiness: a player is only ready to activate if both of its
   // boards are currently reporting. Player 1 -> boards 1/2, Player 2 ->
@@ -109,15 +111,43 @@ function computeBoardsReady() {
 }
 
 const ANSWER_TABLE_PATH = path.join(__dirname, '..', 'answer_table.tsv');
+const ANSWER_STRING_PATH = path.join(__dirname, '..', 'answers-string.txt');
 
 // Same 0-9 resistor scale question_game.ino classifies against and
 // public-admin/app.js's RESISTOR_LABELS mirrors -- kept here too so the
-// docent answer key (below) can render a human label without re-deriving it
+// admin comparison page can render a human label without re-deriving it
 // from the raw ohms column.
 const RESISTOR_LABELS = [
   '470Ω', '1kΩ', '2.2kΩ', '4.7kΩ', '10kΩ',
   '22kΩ', '33kΩ', '47kΩ', '68kΩ', '100kΩ',
 ];
+
+// Parses answers-string.txt (question key, quoted answer text) into a
+// question-key -> answer-text lookup, so the docent answer key can show
+// the actual answer ("Golden Gate Bridge") instead of the resistor value
+// that maps to it on the board.
+function parseAnswerStrings() {
+  let raw;
+  try {
+    raw = fs.readFileSync(ANSWER_STRING_PATH, 'utf8');
+  } catch (err) {
+    console.error(`Could not read answers-string.txt at ${ANSWER_STRING_PATH}: ${err.message}`);
+    console.error('Docent answer key will fall back to resistor values.');
+    return {};
+  }
+
+  const result = {};
+  for (const line of raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
+    const cols = line.split('\t');
+    const questionKey = cols[0];
+    if (!questionKey) continue;
+    const text = (cols[1] || '').trim().replace(/^"(.*)"$/, '$1');
+    result[questionKey] = text;
+  }
+  return result;
+}
+
+const answerStrings = parseAnswerStrings();
 
 // Parses answer_table.tsv once into flat rows -- both loadAnswerIndex()
 // (board-keyed, for the admin live-comparison page) and loadDocentAnswerKey()
@@ -181,12 +211,12 @@ function loadAnswerIndex() {
 const answerIndex = loadAnswerIndex();
 
 // Player-keyed, human-friendly rendering of the same answer table -- names
-// the answer-socket number and resistor value per question instead of the
-// board's raw comparison index. Powers the public page's "Show Answer Key"
-// toggle (see README -- deliberately public/docent-facing, not admin-gated,
-// per an explicit call on this: the public control page is already the
-// docent's page, even though it's also reachable off the LAN per
-// DEPLOYMENT.md).
+// the answer-socket number and the actual answer text per question instead
+// of the board's raw resistor value/comparison index. Powers the public
+// page's "Show Answer Key" toggle (see README -- deliberately
+// public/docent-facing, not admin-gated, per an explicit call on this: the
+// public control page is already the docent's page, even though it's also
+// reachable off the LAN per DEPLOYMENT.md).
 function loadDocentAnswerKey() {
   const result = { 1: [], 2: [], 3: [] };
   for (const row of answerTableRows) {
@@ -194,7 +224,7 @@ function loadDocentAnswerKey() {
     result[row.player].push({
       question: row.question,
       answerSocket: row.answerSocket,
-      resistor: RESISTOR_LABELS[row.index] ?? `? (${row.index})`,
+      answer: answerStrings[`P${row.player}q${row.question}`] ?? RESISTOR_LABELS[row.index] ?? `? (${row.index})`,
     });
   }
   for (const player of Object.keys(result)) {
@@ -413,6 +443,9 @@ function broadcastAdminState() {
 
 const VALID_PULSES = new Set(['reset_game', 'start_game', 'open_monitors', 'reset_best_time']);
 const IDLE_STATE = 1;
+// Cable count above which Start Game gets blocked -- see the finicky-socket
+// note at the start_game handler below.
+const CABLE_BLOCK_THRESHOLD = 3;
 
 wss.on('connection', (ws, req) => {
   ws.isAdmin = isAdminHost(req.headers.host);
@@ -441,7 +474,12 @@ wss.on('connection', (ws, req) => {
       if (msg.action === 'start_game') {
         if (state.gameState !== IDLE_STATE) return;
         if (!Object.values(state.players).some(Boolean)) return;
-        if (state.anyConnected) return;
+        // Only block on a real handful of leftover cables, not a single
+        // stray reading -- socket A1 on player 1 (P1q1) is a finicky
+        // physical socket that occasionally misreads as connected, and
+        // blocking Start over that false positive was more disruptive than
+        // the risk of starting with one or two genuine cables still in.
+        if (state.connectedCables.length > CABLE_BLOCK_THRESHOLD) return;
       }
       sendOSC(`/remote/${msg.action}`, 1);
 

@@ -9,11 +9,25 @@
   const connectionWarningDetailEl = document.getElementById('connectionWarningDetail');
   const answerKeyToggleEl = document.getElementById('answerKeyToggle');
   const answerKeyEl = document.getElementById('answerKey');
+  const docentInstructionsToggleEl = document.getElementById('docentInstructionsToggle');
+  const docentInstructionsEl = document.getElementById('docentInstructions');
 
   const IDLE_STATE = 1;
   const GAMEPLAY_STATE = 6;
   const RESULTS_STATE = 7;
   const RESULT_LABELS = { 1: 'WINNER', 2: '2ND PLACE', 3: '3RD PLACE' };
+
+  // Matches the --p1/--p2/--p3 colors in style.css -- named here so any
+  // copy mentioning a player number can also name its color, since the
+  // patch panels are physically color-coded to match.
+  const PLAYER_COLOR_NAMES = { 1: 'Green', 2: 'Navy', 3: 'Teal' };
+
+  function appendPlayerColorTag(el, player) {
+    const tag = document.createElement('span');
+    tag.className = `player-color-tag p${player}`;
+    tag.textContent = `(${PLAYER_COLOR_NAMES[player]})`;
+    el.append(' ', tag);
+  }
 
   const playerButtons = new Map(
     Array.from(document.querySelectorAll('.player-btn')).map((btn) => [
@@ -103,17 +117,29 @@
     }
   }
 
-  function updateStartButton(gameState, players, anyConnected) {
+  // Mirrors server.js's CABLE_BLOCK_THRESHOLD -- a single stray reading
+  // (P1q1's socket is finicky and occasionally misreads as connected)
+  // shouldn't stop a round, so Start only actually gets blocked once a
+  // real handful of cables are reporting connected.
+  const CABLE_BLOCK_THRESHOLD = 3;
+
+  function updateStartButton(gameState, players, connectedCables) {
     const anyPlayerActive = Object.values(players || {}).some(Boolean);
-    startBtn.disabled = gameState !== IDLE_STATE || !anyPlayerActive || Boolean(anyConnected);
+    const tooManyCables = (connectedCables || []).length > CABLE_BLOCK_THRESHOLD;
+    startBtn.disabled = gameState !== IDLE_STATE || !anyPlayerActive || tooManyCables;
   }
 
-  function updateConnectionWarning(gameState, anyConnected, connectedCables) {
-    const show = gameState === IDLE_STATE && anyConnected;
+  function updateConnectionWarning(gameState, connectedCables) {
+    const count = (connectedCables || []).length;
+    const show = gameState === IDLE_STATE && count > 0;
     connectionWarningEl.hidden = !show;
-    if (show && connectedCables && connectedCables.length) {
+    if (show && count > CABLE_BLOCK_THRESHOLD) {
+      // Only worth naming the specific sockets once there are enough of
+      // them to be a real blocker -- below that it's as likely to be the
+      // finicky P1q1 socket as an actual leftover cable, so naming it would
+      // just send the docent chasing a false lead.
       connectionWarningDetailEl.textContent = connectedCables
-        .map((c) => `Player ${c.player} Q${c.question}`)
+        .map((c) => `Player ${c.player} (${PLAYER_COLOR_NAMES[c.player]}) Q${c.question}`)
         .join(', ');
     } else {
       connectionWarningDetailEl.textContent = '';
@@ -135,13 +161,27 @@
       group.className = 'answer-key-group';
 
       const heading = document.createElement('h3');
-      heading.textContent = `Player ${player}`;
+      heading.append(`Player ${player}`);
+      appendPlayerColorTag(heading, player);
       group.appendChild(heading);
 
       for (const row of rows) {
         const item = document.createElement('div');
         item.className = 'answer-key-row';
-        item.innerHTML = `<span class="answer-key-q">Q${row.question}</span><span class="answer-key-a">Socket A${row.answerSocket}</span><span class="answer-key-ohms">${row.resistor}</span>`;
+
+        const q = document.createElement('span');
+        q.className = 'answer-key-q';
+        q.textContent = `Q${row.question}`;
+
+        const socket = document.createElement('span');
+        socket.className = 'answer-key-a';
+        socket.textContent = `Socket A${row.answerSocket}`;
+
+        const answer = document.createElement('span');
+        answer.className = 'answer-key-text';
+        answer.textContent = row.answer;
+
+        item.append(q, socket, answer);
         group.appendChild(item);
       }
 
@@ -154,6 +194,13 @@
     answerKeyEl.hidden = !showing;
     answerKeyToggleEl.setAttribute('aria-expanded', String(showing));
     answerKeyToggleEl.textContent = showing ? 'Hide Answer Key' : 'Show Answer Key';
+  });
+
+  docentInstructionsToggleEl.addEventListener('click', () => {
+    const showing = docentInstructionsEl.hidden;
+    docentInstructionsEl.hidden = !showing;
+    docentInstructionsToggleEl.setAttribute('aria-expanded', String(showing));
+    docentInstructionsToggleEl.textContent = showing ? 'Hide Docent Instructions' : 'Show Docent Instructions';
   });
 
   function connect() {
@@ -176,8 +223,8 @@
         applyPlayers(msg.players, msg.boardsReady, msg.gameState, msg.playerResults);
         applyGameState(msg.gameState, msg.gameStateLabel);
         updatePlayerButtons(msg.gameState, msg.players, msg.boardsReady);
-        updateStartButton(msg.gameState, msg.players, msg.anyConnected);
-        updateConnectionWarning(msg.gameState, msg.anyConnected, msg.connectedCables);
+        updateStartButton(msg.gameState, msg.players, msg.connectedCables);
+        updateConnectionWarning(msg.gameState, msg.connectedCables);
         applyWaveshare(msg.waveshare);
         if (!answerKeyRendered && msg.answerKey) {
           renderAnswerKey(msg.answerKey);

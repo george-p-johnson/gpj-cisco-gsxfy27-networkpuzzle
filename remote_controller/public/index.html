@@ -25,6 +25,21 @@
   </header>
 
   <main>
+    <section class="docent-instructions-section">
+      <button class="link-btn" id="docentInstructionsToggle" type="button" aria-expanded="false">Show Docent Instructions</button>
+      <div class="docent-instructions" id="docentInstructions" hidden>
+        <ol>
+          <li>Wait for the <strong>status dot</strong> (top right) to read <strong>Connected</strong>, and the six <strong>Boards</strong> dots (top left) to be lit. If a board dot is dark, that player's panel isn't talking to the system yet — its Player button will show <strong>NO BOARDS</strong> and can't be turned on.</li>
+          <li>Turn on the players who are playing this round by tapping their button: <strong>Player 1 (Green)</strong>, <strong>Player 2 (Navy)</strong>, <strong>Player 3 (Teal)</strong>. A player turns green/highlighted when active; tap again to turn them off. At least one player must be on to start.</li>
+          <li>If the yellow <strong>"Unplug all patch cords…"</strong> banner appears, it means the system still sees a patch cable connected from the previous round. Usually this just clears itself once the cables are actually removed. <strong>Start Game</strong> only becomes disabled if several cables are still detected at once — an occasional single warning (especially on Player 1's first socket) can be a harmless sensor quirk and doesn't need troubleshooting on its own.</li>
+          <li>Tap <strong>Start Game</strong>. The Game State will count down (Three → Two → One → Start) and then move into <strong>Gameplay</strong>.</li>
+          <li>During Gameplay, each active player's button updates live as they finish — <strong>WINNER</strong>, <strong>2ND PLACE</strong>, <strong>3RD PLACE</strong>, or <strong>TRY AGAIN</strong> if they don't finish in time. Results stay visible during the <strong>Results</strong> state.</li>
+          <li>Tap <strong>Reset Game</strong> to return to Idle and prep for the next round. This automatically re-activates any player whose boards are online, so you'll typically just need to confirm the right players are on before starting again.</li>
+          <li>Use <strong>Show Answer Key</strong> below to look up the correct answer for any question if a player needs help or a ruling.</li>
+        </ol>
+      </div>
+    </section>
+
     <section class="game-state" id="gameState">
       <span class="game-state-label">Game State</span>
       <span class="game-state-value" id="gameStateValue">&mdash;</span>
@@ -32,15 +47,15 @@
 
     <section class="players">
       <button class="player-btn" data-player="1">
-        <span class="label">Player 1</span>
+        <span class="label">Player 1 <span class="player-color-tag p1">(Green)</span></span>
         <span class="state">OFF</span>
       </button>
       <button class="player-btn" data-player="2">
-        <span class="label">Player 2</span>
+        <span class="label">Player 2 <span class="player-color-tag p2">(Navy)</span></span>
         <span class="state">OFF</span>
       </button>
       <button class="player-btn" data-player="3">
-        <span class="label">Player 3</span>
+        <span class="label">Player 3 <span class="player-color-tag p3">(Teal)</span></span>
         <span class="state">OFF</span>
       </button>
     </section>

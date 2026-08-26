@@ -201,6 +201,19 @@ main {
   color: var(--muted);
 }
 
+.player-color-tag {
+  font-weight: 600;
+}
+
+.player-color-tag.p1 { color: rgb(var(--p1)); }
+.player-color-tag.p2 { color: rgb(var(--p2)); }
+.player-color-tag.p3 { color: rgb(var(--p3)); }
+
+.player-btn .label .player-color-tag {
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
 .player-btn[data-player="1"] { border-color: rgb(var(--p1)); }
 .player-btn[data-player="2"] { border-color: rgb(var(--p2)); }
 .player-btn[data-player="3"] { border-color: rgb(var(--p3)); }
@@ -288,11 +301,35 @@ main {
   opacity: 0.6;
 }
 
+.docent-instructions-section,
 .answer-key-section {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 0.75rem;
+}
+
+.docent-instructions {
+  width: 100%;
+  padding: 1rem 1.25rem;
+  border-radius: 0.9rem;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.docent-instructions[hidden] {
+  display: none;
+}
+
+.docent-instructions ol {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.docent-instructions li + li {
+  margin-top: 0.6rem;
 }
 
 .link-btn {
@@ -309,7 +346,7 @@ main {
 .answer-key {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 1rem;
   padding: 1rem;
   border-radius: 0.9rem;
@@ -332,7 +369,7 @@ main {
 
 .answer-key-row {
   display: grid;
-  grid-template-columns: 1.6rem 1fr auto;
+  grid-template-columns: 1.6rem auto 1fr;
   gap: 0.5rem;
   align-items: baseline;
   padding: 0.2rem 0;
@@ -348,7 +385,7 @@ main {
   color: var(--muted);
 }
 
-.answer-key-ohms {
+.answer-key-text {
   font-weight: 600;
   color: var(--text);
   text-align: right;
